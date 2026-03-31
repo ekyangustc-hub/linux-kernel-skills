@@ -207,7 +207,31 @@ int ext4_ext_remove_space(struct inode *inode, ext4_lblk_t start,
 #define EXT4_EXT_STATUS_UNWRITTEN  0x2  /* 未写入 (预分配) */
 ```
 
-### 6.2 预分配 Extent
+### 6.2 标志语义 (flags)
+
+```c
+/* 转换标志 */
+#define EXT4_GET_BLOCKS_CONVERT           /* 将分割后的 extent 转换为 written */
+#define EXT4_GET_BLOCKS_CONVERT_UNWRITTEN /* 将分割后的 extent 转换为 unwritten */
+#define EXT4_GET_BLOCKS_METADATA_NOFAIL   /* 使用预留元数据块，确保分割不失败 */
+#define EXT4_EX_NOCACHE                   /* 不缓存到 extent status tree */
+
+/* 已移除的标志 (不再使用) */
+/* EXT4_GET_BLOCKS_IO_CREATE_EXT */     /* 旧: 在 I/O 提交前分割 extent */
+```
+
+### 6.3 Zeroout 回退机制
+
+当 extent 树操作失败时，zeroout 作为安全回退:
+
+| 转换类型 | Zeroout 行为 |
+|----------|-------------|
+| unwritten → written | Zeroout 映射范围之外的部分 |
+| written → unwritten | Zeroout 仅映射范围 |
+
+**最大 zeroout 限制**: 为防止 zeroout 耗时过长，设置了最大 zeroout 块数限制。
+
+### 6.4 预分配 Extent
 
 ```c
 /* 创建预分配 extent */
@@ -218,6 +242,24 @@ int ext4_ext_convert_to_initialized(handle_t *handle,
     /* 将 unwritten extent 转换为 written */
 }
 ```
+
+### 6.5 延迟分割策略 (Deferred Splitting)
+
+现代 ext4 将 extent 分割推迟到 I/O 完成时:
+
+```
+旧流程 (已废弃):
+  分配块 → 分割 extent (启动 journal handle) → 提交 I/O → endio 转换
+  
+新流程 (当前):
+  分配块 → 提交 I/O (无 journal handle) → endio 分割+转换
+```
+
+**优势**:
+- 避免在 I/O 提交时启动不必要的 journal handle
+- 合并 I/O 完成时减少不必要的分割操作
+- 提升并发 DIO 性能 (~25%)
+- 使用 `EXT4_GET_BLOCKS_METADATA_NOFAIL` 确保分割不失败
 
 ---
 

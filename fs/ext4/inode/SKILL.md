@@ -1,6 +1,6 @@
 ---
 name: "ext4-inode"
-description: "ext4文件系统Inode结构专家。当用户询问ext4 inode结构、i_mode、i_block、extent树、inode分配时调用此技能。"
+description: "ext4文件系统Inode结构专家。当用户询问ext4 inode结构、i_mode、i_block、extent树、inode分配、fsverity读取路径时调用此技能。"
 ---
 
 # ext4 Inode 结构
@@ -269,7 +269,45 @@ stat /path/to/file
 
 ---
 
-## 十、参考资源
+## 十、Inode 缓存优化
+
+### 10.1 空闲指针偏移
+
+`ext4_inode_cache` 使用 `kmem_cache_args` 接口并指定空闲指针偏移在 `i_flags` 字段，减少对象大小。由于构造函数不使用 `i_flags`，可以安全地复用该字段作为空闲指针。
+
+```c
+/* fs/ext4/super.c */
+struct kmem_cache_args args = {
+    .free_pointer_offset = offsetof(struct ext4_inode, i_flags),
+};
+sbi->s_inode_cache = kmem_cache_create("ext4_inode_cache",
+                                       sizeof(struct ext4_inode), &args);
+```
+
+---
+
+## 十一、Fsverity 读取路径
+
+### 11.1 读取路径优化
+
+现代 ext4 将 `->read_folio` 和 `->readahead` 操作移至 `readpage.c`，所有 pagecache 读取代码集中在一个文件中。
+
+**核心优化**:
+- `fsverity_info` 查找在 `ext4_mpage_readpages` 中只执行一次
+- 查找结果用于 readahead、空洞验证和 I/O 完成工作队列
+- 通过 `struct bio_post_read_ctx` 传递 `fsverity_info` 到 I/O 完成路径
+
+### 11.2 代码布局
+
+| 功能 | 文件路径 |
+|------|----------|
+| read_folio / readahead | `fs/ext4/readpage.c` |
+| fsverity_info 查找 | `fs/ext4/readpage.c` |
+| I/O 完成上下文 | `fs/ext4/readpage.c` |
+
+---
+
+## 十二、参考资源
 
 - ext4 官方文档: `Documentation/filesystems/ext4/`
-- ext4 内核代码: `fs/ext4/ext4.h`
+- ext4 内核代码: `fs/ext4/ext4.h`, `fs/ext4/readpage.c`

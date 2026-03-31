@@ -1,13 +1,13 @@
 ---
 name: "ext4-runtime"
-description: "ext4文件系统运行时行为专家。当用户询问ext4文件操作流程(新建/删除/写入)、日志一致性保证、JBD2事务机制、revoke机制、孤儿列表、断电恢复时调用此技能。"
+description: "ext4文件系统运行时行为专家。当用户询问ext4文件操作流程(新建/删除/写入)、日志一致性保证、JBD2事务机制、revoke机制、孤儿列表、断电恢复、fast-commit、extent转换流程时调用此技能。"
 ---
 
 # ext4 运行时行为
 
 ## 一、概述
 
-ext4 的运行时行为包括文件操作流程、日志一致性保证、JBD2 事务机制等。
+ext4 的运行时行为包括文件操作流程、日志一致性保证、JBD2 事务机制、extent 转换流程、fast-commit 机制等。
 
 ---
 
@@ -368,8 +368,137 @@ cat /proc/fs/ext4/sda1/mb_groups
 
 ---
 
-## 十一、参考资源
+## 十一、Fast Commit 机制
+
+### 11.1 概述
+
+Fast Commit 是 ext4 的优化日志机制，对常见操作(如创建、删除、重命名)使用精简的 TLV 格式记录，避免完整的事务提交开销。
+
+### 11.2 Fast Commit 不兼容操作
+
+某些操作会标记文件系统为 fast-commit ineligible，强制回退到完整提交:
+
+| 操作 | 原因 | 代码位置 |
+|------|------|----------|
+| Group Extend (`EXT4_IOC_GROUP_EXTEND`) | 更新超级块元数据，无 fast commit 回放支持 | `fs/ext4/ioctl.c` |
+| Group Add (`EXT4_IOC_GROUP_ADD`) | 更新超级块和块组描述符 | `fs/ext4/ioctl.c` |
+| Move Extents (`EXT4_IOC_MOVE_EXT`) | 交换两个文件的 extent 布局 | `fs/ext4/move_extent.c` |
+| fs-verity Enable | 构建 Merkle 树，更新 inode 和孤儿状态 | `fs/ext4/verity.c` |
+| Inode Format Migration (`EXT4_IOC_MIGRATE`) | 重写 inode 块映射表示(indirect↔extent) | `fs/ext4/migrate.c` |
+
+### 11.3 Fast Commit 锁安全
+
+`s_fc_lock` 是 reclaim-safe 的，使用 `ext4_fc_lock()`/`ext4_fc_unlock()` 辅助函数，在持有锁期间通过 `memalloc_nofs_save()`/`restore()` 防止内存回收递归:
+
+```c
+/* fs/ext4/ext4.h */
+static inline void ext4_fc_lock(struct super_block *sb)
+{
+    memalloc_nofs_save();
+    spin_lock(&EXT4_SB(sb)->s_fc_lock);
+}
+
+static inline void ext4_fc_unlock(struct super_block *sb)
+{
+    spin_unlock(&EXT4_SB(sb)->s_fc_lock);
+    memalloc_nofs_restore();
+}
+```
+
+---
+
+## 十二、Extent 转换流程 (endio 路径)
+
+### 12.1 延迟分割策略
+
+现代 ext4 将 extent 分割推迟到 I/O 完成时，而非提交 I/O 前:
+
+```
+旧流程:
+  分配块 → 分割 extent (启动 journal handle) → 提交 I/O → endio 转换
+  
+新流程:
+  分配块 → 提交 I/O (无 journal handle) → endio 分割+转换
+```
+
+**优势**:
+- 避免在 I/O 提交时启动不必要的 journal handle
+- 合并 I/O 完成时减少不必要的分割操作
+- 提升并发 DIO 性能 (~25%)
+
+### 12.2 预留元数据块保护
+
+使用 `EXT4_GET_BLOCKS_METADATA_NOFAIL` 标志，在 extent 分割时使用预留的 2% 空间或 4096 个块，防止因空间不足导致数据丢失。
+
+### 12.3 Zeroout 回退机制
+
+当 extent 树操作失败时，zeroout 作为回退机制:
+
+| 转换类型 | Zeroout 行为 |
+|----------|-------------|
+| unwritten → written | Zeroout 映射范围之外的部分 |
+| written → unwritten | Zeroout 仅映射范围 |
+
+**标志语义**:
+- `EXT4_GET_BLOCKS_CONVERT`: 将分割后的 extent 转换为 written
+- `EXT4_GET_BLOCKS_CONVERT_UNWRITTEN`: 将分割后的 extent 转换为 unwritten
+- `EXT4_EX_NOCACHE`: 不缓存到 extent status tree
+
+### 12.4 核心函数
+
+```c
+/* 分割 extent */
+int ext4_split_extent(handle_t *handle, struct inode *inode,
+                      struct ext4_ext_path **ppath, ext4_lblk_t split,
+                      int split_flag, int flags);
+
+/* 分割并转换 extent */
+int ext4_split_convert_extents(handle_t *handle, struct inode *inode,
+                               ext4_lblk_t block, struct ext4_ext_path *path,
+                               int flags);
+
+/* endio 路径转换 unwritten extent */
+int ext4_convert_unwritten_extents_endio(handle_t *handle, struct inode *inode,
+                                         struct ext4_map_blocks *map,
+                                         struct ext4_ext_path *path, int flags);
+```
+
+---
+
+## 十三、DIO 写入路径简化
+
+### 13.1 移除的结构
+
+- `ext4_iomap_overwrite_ops`: 被 `ext4_iomap_ops` 统一处理
+- `EXT4_GET_BLOCKS_IO_CREATE_EXT`: 不再在 I/O 提交前分割 extent
+- `ext4_dio_write_iter()` 的 `unwritten` 参数: 已移除
+
+### 13.2 写入路径流程
+
+```
+ext4_dio_write_iter()
+    │
+    ├── iomap_dio_rw()
+    │   │
+    │   └── ext4_iomap_begin()
+    │       │
+    │       ├── 查询映射 (ext4_map_blocks)
+    │       ├── 处理 unwritten/delayed 分配
+    │       └── 返回 iomap 描述符
+    │
+    └── ext4_dio_write_end_io()
+        │
+        └── ext4_convert_unwritten_extents_endio()
+            │
+            ├── 使用 METADATA_NOFAIL 预留空间
+            ├── 分割 extent (如需要)
+            └── 转换为 written extent
+```
+
+---
+
+## 十四、参考资源
 
 - ext4 官方文档: `Documentation/filesystems/ext4/`
 - JBD2 内核代码: `fs/jbd2/`
-- ext4 内核代码: `fs/ext4/ext4_jbd2.c`
+- ext4 内核代码: `fs/ext4/ext4_jbd2.c`, `fs/ext4/extents.c`, `fs/ext4/fast_commit.c`

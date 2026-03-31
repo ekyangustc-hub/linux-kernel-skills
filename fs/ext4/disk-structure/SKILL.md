@@ -902,17 +902,43 @@ static inline int ext4_has_group_desc_csum(struct super_block *sb)
 
 ---
 
-## 九、关键代码位置索引
+## 九、Sysfs 属性
+
+### 9.1 错误报告控制
+
+```
+/sys/fs/ext4/<dev>/err_report_sec
+```
+
+控制 `s_err_report` 定时器，用于定期报告文件系统错误:
+- 写入 `0`: 禁用定时器
+- 写入非零值: 启用定时器，设置超时时间(秒)
+
+### 9.2 Fast Commit 统计
+
+```
+/proc/fs/ext4/<dev>/fc_info
+```
+
+显示 fast-commit 统计信息，包括不兼容原因计数:
+- Resize: group extend/add 操作
+- Move extents: extent 交换操作
+- fs-verity enable: 启用 fs-verity
+- Inode format migration: inode 格式迁移
+
+---
+
+## 十、关键代码位置索引
 
 | 结构 | 定义位置 | 说明 |
 |------|----------|------|
-| ext4_super_block | `fs/ext4/ext4.h:1332-1463` | 超级块 |
-| ext4_group_desc | `fs/ext4/ext4.h:403-428` | 块组描述符 |
-| ext4_inode | `fs/ext4/ext4.h:795-854` | Inode |
-| ext4_extent_header | `fs/ext4/ext4_extents.h:48-56` | Extent 头 |
-| ext4_extent | `fs/ext4/ext4_extents.h:58-64` | Extent 结构 |
-| ext4_extent_idx | `fs/ext4/ext4_extents.h:66-72` | Extent 索引 |
-| ext4_dir_entry_2 | `fs/ext4/ext4.h:2396-2454` | 目录项 |
-| dx_root | `fs/ext4/namei.c:235-260` | HTREE 根节点 |
-| dx_node | `fs/ext4/namei.c:262-266` | HTREE 内部节点 |
-| flex_groups | `fs/ext4/ext4.h:441-445` | Flex 组统计 |
+| ext4_super_block | `fs/ext4/ext4.h` | 超级块 |
+| ext4_group_desc | `fs/ext4/ext4.h` | 块组描述符 |
+| ext4_inode | `fs/ext4/ext4.h` | Inode |
+| ext4_extent_header | `fs/ext4/ext4_extents.h` | Extent 头 |
+| ext4_extent | `fs/ext4/ext4_extents.h` | Extent 结构 |
+| ext4_extent_idx | `fs/ext4/ext4_extents.h` | Extent 索引 |
+| ext4_dir_entry_2 | `fs/ext4/ext4.h` | 目录项 |
+| dx_root | `fs/ext4/namei.c` | HTREE 根节点 |
+| dx_node | `fs/ext4/namei.c` | HTREE 内部节点 |
+| flex_groups | `fs/ext4/ext4.h` | Flex 组统计 |
