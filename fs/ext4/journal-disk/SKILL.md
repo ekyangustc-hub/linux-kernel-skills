@@ -316,7 +316,64 @@ debugfs: stat 8
 
 ---
 
-## 十一、参考资源
+## 十一、JBD2 关键修复 (2025-2026)
+
+### 11.1 软死锁修复
+
+**问题**: `jbd2_log_do_checkpoint()` 可能触发软死锁 (softlockup)
+
+```
+watchdog: BUG: soft lockup - CPU#3 stuck for 156s!
+Call trace:
+ native_queued_spin_lock_slowpath
+ jbd2_log_do_checkpoint
+ __jbd2_log_wait_for_space
+```
+
+**原因**: `jbd2_log_do_checkpoint()` 依赖 `__flush_batch()` 或 `wait_on_buffer()` 触发调度，如果这些函数不睡眠，会导致软死锁。
+
+**修复**: 显式调用 `cond_resched()` 避免软死锁。
+
+### 11.2 检查点 I/O 优先级
+
+```c
+/* jbd2: increase IO priority of checkpoint */
+/* 提高检查点的 I/O 优先级 */
+/* 确保检查点尽快完成，释放日志空间 */
+```
+
+### 11.3 释放块前等待 I/O 完成
+
+**问题**: `jbd2_journal_forget()` 在释放元数据块时，不等待正在进行的 I/O 完成。
+
+**风险**:
+1. 如果缓冲区正在写回，不等待完成就重新分配，可能导致旧数据写入新分配的块
+2. 并发写回可能在 `clear_buffer_dirty()` 之前发生
+
+**修复**: 显式确保所有正在进行的 I/O 完成后再释放块。
+
+### 11.4 日志超级块校验和修复
+
+**问题**: 只读挂载时复制文件系统，可能导致日志超级块校验和不匹配。
+
+**原因**: `set_journal_csum_feature_set()` 修改日志超级块数据但未更新校验和。
+
+**修复**: 修改日志超级块后更新内存中的校验和。
+
+### 11.5 其他 JBD2 修复
+
+| 修复 | 说明 |
+|------|------|
+| `avoid bug_on in jbd2_journal_get_create_access()` | 文件系统损坏时避免 BUG_ON |
+| `store more accurate errno in superblock` | 在超级块中存储更准确的错误号 |
+| `use a per-journal lock_class_key` | 每个 journal 使用独立的 lock_class_key |
+| `use a weaker annotation in journal handling` | 使用更弱的锁注解 |
+| `fix data-race and null-ptr-deref` | 修复数据竞争和空指针解引用 |
+| `convert jbd2_journal_blocks_per_page() to support large folio` | 支持 large folio |
+
+---
+
+## 十二、参考资源
 
 - ext4 官方文档: `Documentation/filesystems/ext4/`
 - JBD2 内核代码: `fs/jbd2/`

@@ -926,6 +926,37 @@ static inline int ext4_has_group_desc_csum(struct super_block *sb)
 - fs-verity enable: 启用 fs-verity
 - Inode format migration: inode 格式迁移
 
+### 9.3 新 Ioctls
+
+```c
+/* ext4: implemet new ioctls to set and get superblock parameters */
+/* 新增 ioctls 用于设置和获取超级块参数 */
+
+EXT4_IOC_SETTUNE_SB    /* 设置超级块参数 (uid/gid等) */
+EXT4_IOC_GETTUNE_SB    /* 获取超级块参数 */
+```
+
+### 9.4 32-bit UID/GID 支持
+
+```c
+/* ext4: add support for 32-bit default reserved uid and gid values */
+/* 支持 32 位默认保留 uid 和 gid 值 */
+/* 旧版本仅支持 16 位 */
+```
+
+### 9.5 Large Block Size 特性
+
+```bash
+# 检查是否支持 BS > PS
+cat /sys/fs/ext4/features/blocksize_gt_pagesize
+# 返回 1 表示支持，0 表示不支持
+```
+
+当块大小 > 页面大小时:
+- 需要 `CONFIG_TRANSPARENT_HUGEPAGE`
+- 使用 large folio 机制
+- 不兼容加密等特性
+
 ---
 
 ## 十、关键代码位置索引

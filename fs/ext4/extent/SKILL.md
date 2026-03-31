@@ -261,6 +261,46 @@ int ext4_ext_convert_to_initialized(handle_t *handle,
 - 提升并发 DIO 性能 (~25%)
 - 使用 `EXT4_GET_BLOCKS_METADATA_NOFAIL` 确保分割不失败
 
+### 6.6 Extent 序列号 (Seq Counter)
+
+**引入时间**: 2025年
+
+类似 XFS 的 extent 序列号机制，为 extent status tree 引入序列号作为有效性 cookie。
+
+```c
+/* 查找 extent 时返回序列号 */
+int ext4_es_lookup_extent(struct inode *inode, ext4_lblk_t lblk,
+                            ext4_lblk_t *es_seq);
+```
+
+**使用场景**:
+- iomap buffered write: 查询映射和写入之间检查序列号
+- writeback: 提交 I/O 前检查序列号
+- move extent: 移动时检查 extent 类型是否变更
+
+### 6.7 部分数据有效标志
+
+```c
+/* ext4: subdivide EXT4_EXT_DATA_VALID1 */
+/* 细分 EXT4_EXT_DATA_VALID1 标志 */
+
+/* ext4: don't zero the entire extent if EXT4_EXT_DATA_PARTIAL_VALID1 */
+/* 如果是部分有效，不 zeroout 整个 extent */
+```
+
+### 6.8 分裂时不缓存
+
+```c
+/* ext4: don't cache extent during splitting extent */
+/* 分裂 extent 时不缓存到 extent status tree */
+
+/* ext4: drop extent cache when splitting extent fails */
+/* 分裂 extent 失败时丢弃 extent 缓存 */
+
+/* ext4: drop extent cache after doing PARTIAL_VALID1 zeroout */
+/* 执行 PARTIAL_VALID1 zeroout 后丢弃 extent 缓存 */
+```
+
 ---
 
 ## 七、延迟分配

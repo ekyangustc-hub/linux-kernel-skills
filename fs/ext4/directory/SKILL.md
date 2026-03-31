@@ -242,7 +242,29 @@ u32 ext4_htree_hash(const char *name, int len)
 
 ## 七、目录操作
 
-### 7.1 添加目录项
+### 7.1 内联目录转换重构
+
+```c
+/* ext4: refactor the inline directory conversion and new directory codepaths */
+/* 重构内联目录转换和新目录代码路径 */
+/* 统一处理逻辑，减少代码重复 */
+```
+
+### 7.2 Large Block Size 支持
+
+```c
+/* ext4: support large block size in ext4_readdir() */
+/* 目录读取现在支持大块大小 */
+
+/* ext4: remove PAGE_SIZE checks for rec_len conversion */
+/* 移除 rec_len 转换中的 PAGE_SIZE 检查 */
+
+/* ext4: remove page offset calculation in ext4_block_truncate_page() */
+/* ext4: remove page offset calculation in ext4_block_zero_page_range() */
+/* 移除页偏移计算，使用 folio 替代 */
+```
+
+### 7.3 添加目录项
 
 ```c
 int ext4_add_entry(handle_t *handle, struct dentry *dentry,

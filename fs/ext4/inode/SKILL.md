@@ -284,6 +284,41 @@ sbi->s_inode_cache = kmem_cache_create("ext4_inode_cache",
                                        sizeof(struct ext4_inode), &args);
 ```
 
+### 10.2 Uncached Buffered I/O
+
+```c
+/* ext4: support uncached buffered I/O */
+/* 设置 FOP_DONTCACHE 声明支持 uncached buffered I/O */
+/* 使用 write_begin_get_folio() 封装 FGP_DONTCACHE 逻辑 */
+```
+
+### 10.3 Large Folio 支持
+
+```c
+/* ext4: enable large folio for regular file */
+/* 为普通文件启用 large folio */
+mapping_set_large_folios(inode->i_mapping);
+
+/* ext4: limit the maximum folio order */
+/* 限制最大 folio order，防止内存分配失败 */
+```
+
+### 10.4 ACL 优化
+
+```c
+/* ext4: mark inodes without acls in __ext4_iget() */
+/* 在 __ext4_iget() 中标记没有 ACL 的 inode */
+/* 避免重复检查 ACL 存在性 */
+```
+
+### 10.5 Inode 状态标志清理
+
+```c
+/* ext4: clear i_state_flags when alloc inode */
+/* 分配 inode 时清理 i_state_flags */
+/* 防止状态标志泄漏 */
+```
+
 ---
 
 ## 十一、Fsverity 读取路径
