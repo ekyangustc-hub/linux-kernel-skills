@@ -5,6 +5,16 @@ description: "ext4扩展属性(Extended Attributes)专家。当用户询问ext4 
 
 # ext4 Extended Attributes (xattr)
 
+## 〇、为什么需要这个机制？
+
+为什么需要扩展属性？POSIX ACL、SELinux 标签、用户自定义属性等都需要存储额外的键值对。ext4 最初只支持内联 xattr（inode 扩展区域），后来支持外部 xattr 块和 EA inode（值存储在单独 inode 中）。2025 年进行了全面的 xattr 验证修复，防止恶意数据导致内核崩溃。
+
+传统的 Unix 文件系统只有固定的元数据字段（权限、时间戳、大小等），无法满足现代安全模型和应用程序的需求。xattr 提供了一种灵活的扩展机制，允许在文件上附加任意键值对。
+
+没有 xattr，SELinux/AppArmor 安全标签、POSIX ACL、用户自定义属性、inline data 等现代功能都无法实现。
+
+---
+
 ## 一、概述
 
 扩展属性 (xattr) 允许用户和系统为文件存储额外的键值对元数据。ext4 支持内联 xattr (存储在 inode 内) 和外部 xattr (存储在单独的数据块中)。近年来在 xattr 验证、ea_inode 安全方面进行了大量修复。

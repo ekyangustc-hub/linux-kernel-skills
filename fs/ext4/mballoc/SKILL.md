@@ -3,281 +3,164 @@ name: "ext4-mballoc"
 description: "ext4多块分配器(Mballoc)专家。当用户询问ext4块分配策略、mb_optimize_scan、组选择算法、xarray优化、全局目标、碎片管理、 buddy系统时调用此技能。"
 ---
 
-# ext4 Mballoc (多块分配器)
+# ext4 Mballoc
 
-## 一、概述
+## 〇、为什么需要这个机制？
 
-Mballoc (Multi-Block Allocator) 是 ext4 的核心块分配子系统，负责为文件数据分配连续的物理块。近年来经历了大规模重构，引入 xarray、多全局目标、跳过忙组等优化。
+为什么需要多块分配器？ext2/ext3 的单块分配器一次只分配一个块，导致严重的碎片和低效。Mballoc 一次分配多个连续块，减少碎片、提升性能。2025 年的 xarray 优化替代了链表遍历，使组选择算法可以跳过忙组，大幅提升多核扩展性。
+
+单块分配器的问题在于：它不考虑文件未来的访问模式，也不尝试保持文件的连续性。随着文件系统的长期使用，文件变得越来越碎片化，读写性能急剧下降。Mballoc 通过预分配、 locality group、多级搜索标准等策略，显著改善了这一问题。
+
+没有 Mballoc，ext4 在长期使用后会产生严重碎片，大文件的顺序读写性能会大幅下降，多核并发分配也会成为瓶颈。
 
 ---
 
-## 二、核心数据结构
-
-### 2.1 ext4_allocation_context
-
-**位置**: `fs/ext4/mballoc.c`
+## 一、分配标志 (verified: ext4.h:186-209)
 
 ```c
-struct ext4_allocation_context {
-    struct inode *ac_inode;           /* 请求分配的 inode */
-    struct super_block *ac_sb;        /* 超级块 */
+#define EXT4_MB_HINT_MERGE		0x0001	/* prefer goal again */
+#define EXT4_MB_HINT_FIRST		0x0008	/* first blocks in the file */
+#define EXT4_MB_HINT_DATA		0x0020	/* data is being allocated */
+#define EXT4_MB_HINT_NOPREALLOC		0x0040	/* don't preallocate */
+#define EXT4_MB_HINT_GROUP_ALLOC	0x0080	/* allocate for locality group */
+#define EXT4_MB_HINT_GOAL_ONLY		0x0100	/* allocate goal blocks or none */
+#define EXT4_MB_HINT_TRY_GOAL		0x0200	/* goal is meaningful */
+#define EXT4_MB_DELALLOC_RESERVED	0x0400	/* blocks already pre-reserved */
+#define EXT4_MB_STREAM_ALLOC		0x0800	/* stream allocation */
+#define EXT4_MB_USE_ROOT_BLOCKS		0x1000	/* Use reserved root blocks */
+#define EXT4_MB_USE_RESERVED		0x2000	/* Use blocks from reserved pool */
+#define EXT4_MB_STRICT_CHECK		0x4000	/* strict check for free blocks */
+```
 
-    ext4_lblk_t ac_o_ex.fe_logical;   /* 原始请求逻辑块 */
-    ext4_fsblk_t ac_o_ex.fe_start;    /* 原始请求物理块 */
-    ext4_group_t ac_o_ex.fe_group;    /* 原始请求块组 */
+---
 
-    ext4_lblk_t ac_g_ex.fe_logical;   /* 目标逻辑块 */
-    ext4_fsblk_t ac_g_ex.fe_start;    /* 目标物理块 */
-    ext4_group_t ac_g_ex.fe_group;    /* 目标块组 */
+## 二、搜索标准 (Criteria, verified: ext4.h:137-177)
 
-    ext4_lblk_t ac_f_ex.fe_logical;   /* 最终分配逻辑块 */
-    ext4_fsblk_t ac_f_ex.fe_start;    /* 最终分配物理块 */
-    ext4_group_t ac_f_ex.fe_group;    /* 最终分配块组 */
+```c
+enum criteria {
+	CR_POWER2_ALIGNED,	/* 2的幂次对齐, 最快, 无磁盘IO */
+	CR_GOAL_LEN_FAST,	/* 目标长度, 快速, 仅内存 */
+	CR_BEST_AVAIL_LEN,	/* 最佳可用长度, 允许缩减 */
+	CR_GOAL_LEN_SLOW,	/* 目标长度, 慢速, 需要磁盘IO */
+	CR_ANY_FREE,		/* 任意空闲块, 最后手段 */
+	EXT4_MB_NUM_CRS,
+};
 
-    ext4_lblk_t ac_len;               /* 请求块数 */
-    ext4_lblk_t ac_glen;              /* 目标块数 */
-    ext4_lblk_t ac_b_ex.fe_len;       /* 实际分配块数 */
+static inline bool ext4_mb_cr_expensive(enum criteria cr)
+{
+	return cr >= CR_GOAL_LEN_SLOW;
+}
+```
 
-    unsigned int ac_flags;            /* 分配标志 */
-    unsigned int ac_criteria;         /* 当前搜索标准 (CR) */
-    ext4_group_t ac_last_group;       /* 上次搜索的块组 */
-    ext4_group_t ac_groups_scanned;   /* 已扫描的块组数 */
-    ...
+---
+
+## 三、ext4_allocation_request (verified: ext4.h:211-230)
+
+```c
+struct ext4_allocation_request {
+	struct inode *inode;
+	unsigned int len;
+	ext4_lblk_t logical;
+	ext4_lblk_t lleft;
+	ext4_lblk_t lright;
+	ext4_fsblk_t goal;
+	ext4_fsblk_t pleft;
+	ext4_fsblk_t pright;
+	unsigned int flags;
 };
 ```
 
-### 2.2 搜索标准 (Criteria)
+---
+
+## 四、ext4_sb_info 中的 mballoc 字段 (verified: ext4.h:1605-1661)
 
 ```c
-/* 搜索标准的优先级顺序，从严格到宽松 */
-#define CR_POWER2_ALIGNED       0   /* 2的幂次对齐 */
-#define CR_GOAL_LEN_SLOW        1   /* 目标长度 (慢速) */
-#define CR_GOAL_LEN_FAST        2   /* 目标长度 (快速) */
-#define CR_BEST_AVAIL_LEN       3   /* 最佳可用长度 */
-#define CR_ANY_FREE             4   /* 任意空闲块 */
-```
+struct ext4_sb_info {
+	/* buddy allocator */
+	struct ext4_group_info ** __rcu *s_group_info;
+	struct inode *s_buddy_cache;
+	spinlock_t s_md_lock;
+	unsigned short *s_mb_offsets;
+	unsigned int *s_mb_maxs;
+	unsigned int s_group_info_size;
+	atomic_t s_mb_free_pending;
+	struct list_head s_freed_data_list[2];
+	struct list_head s_discard_list;
+	struct work_struct s_discard_work;
+	atomic_t s_retry_alloc_pending;
+	struct xarray *s_mb_avg_fragment_size;	/* xarray, 2025 */
+	struct xarray *s_mb_largest_free_orders; /* xarray, 2025 */
 
-### 2.3 Buddy 系统
+	/* tunables */
+	unsigned long s_stripe;
+	unsigned int s_mb_max_linear_groups;
+	unsigned int s_mb_stream_request;
+	unsigned int s_mb_max_to_scan;
+	unsigned int s_mb_min_to_scan;
+	unsigned int s_mb_stats;
+	unsigned int s_mb_order2_reqs;
+	unsigned int s_mb_group_prealloc;
+	unsigned int s_mb_prefetch;
+	unsigned int s_mb_prefetch_limit;
+	unsigned int s_mb_best_avail_max_trim_order;
 
-```c
-struct ext4_buddy {
-    struct super_block *bd_sb;
-    ext4_group_t bd_group;          /* 块组号 */
-    struct ext4_group_info *bd_info; /* 组信息 */
-    void *bd_bitmap;                /* buddy 位图 */
-    struct page *bd_buddy_page;     /* buddy 页 */
-    struct page *bd_bitmap_page;    /* 位图页 */
-    ...
+	/* 多全局目标, 2025 */
+	ext4_group_t *s_mb_last_groups;
+	unsigned int s_mb_nr_global_goals;
+
+	/* stats */
+	atomic_t s_bal_reqs;
+	atomic_t s_bal_success;
+	atomic_t s_bal_allocated;
+	atomic_t s_bal_ex_scanned;
+	atomic_t s_bal_cX_ex_scanned[EXT4_MB_NUM_CRS];
+	atomic_t s_bal_groups_scanned;
+	atomic_t s_bal_goals;
+	atomic_t s_bal_stream_goals;
+	atomic_t s_bal_len_goals;
+	atomic_t s_bal_breaks;
+	atomic_t s_bal_2orders;
+	atomic64_t s_bal_cX_groups_considered[EXT4_MB_NUM_CRS];
+	atomic64_t s_bal_cX_hits[EXT4_MB_NUM_CRS];
+	atomic64_t s_bal_cX_failed[EXT4_MB_NUM_CRS];
+	atomic_t s_mb_buddies_generated;
+	atomic64_t s_mb_generation_time;
+	atomic_t s_mb_lost_chunks;
+	atomic_t s_mb_preallocated;
+	atomic_t s_mb_discarded;
+	atomic_t s_lock_busy;
+
+	/* locality groups */
+	struct ext4_locality_group __percpu *s_locality_groups;
 };
 ```
 
 ---
 
-## 三、块分配流程
+## 五、Xarray 优化 (2025)
 
-### 3.1 整体流程
-
-```
-ext4_mb_new_blocks()
-    │
-    ├── 1. 初始化分配上下文 (ac)
-    │   ├── 设置 ac_o_ex (原始请求)
-    │   ├── 设置 ac_g_ex (目标请求)
-    │   └── 计算 ac_flags
-    │
-    ├── 2. ext4_mb_regular_allocator()
-    │   │
-    │   ├── 2.1 预取 (Prefetch)
-    │   │   └── ext4_mb_prefetch()
-    │   │
-    │   ├── 2.2 组选择循环
-    │   │   └── ext4_mb_scan_groups()
-    │   │       │
-    │   │       ├── 线性扫描 (ext4_mb_scan_groups_linear)
-    │   │       │   └── 从指定组开始，扫描最多 s_mb_max_linear_groups 个组
-    │   │       │
-    │   │       └── 非线性扫描 (ext4_mb_scan_group)
-    │   │           ├── 使用 xarray 有序遍历
-    │   │           ├── 使用 ext4_try_lock_group() 跳过忙组
-    │   │           └── 多全局目标减少竞争
-    │   │
-    │   └── 2.3 Buddy 分配
-    │       └── ext4_mb_simple_scan_group()
-    │
-    ├── 3. ext4_mb_mark_diskspace_used()
-    │   └── 更新位图和元数据
-    │
-    └── 4. 返回分配结果
-```
-
-### 3.2 组选择算法重构 (scan group)
-
-**旧流程 (choose group)**:
-```
-选择"好组" → 扫描该组 → 失败则重新选择
-问题: 在列表遍历时持有 spin_lock，无法使用 ext4_try_lock_group()，
-      导致"弹跳"问题 (反复从同一组开始)
-```
-
-**新流程 (scan group)**:
-```
-ext4_mb_scan_groups()
-    │
-    ├── ext4_mb_scan_groups_linear()
-    │   └── 从指定组开始线性扫描，最多 s_mb_max_linear_groups 次
-    │
-    └── ext4_mb_scan_group()
-        └── 使用 xarray 有序遍历，支持 ext4_try_lock_group() 跳过忙组
-```
+- **旧**: 链表遍历需要 spin_lock, 无法跳过忙组
+- **新**: xarray 有序遍历, 支持 `ext4_try_lock_group()` 跳过忙组
+- **s_mb_avg_fragment_size**: 按平均碎片大小排序的 xarray
+- **s_mb_largest_free_orders**: 按最大空闲长度排序的 xarray
 
 ---
 
-## 四、Xarray 优化
-
-### 4.1 概述
-
-将空闲组列表从链表转换为有序 xarray，实现无锁遍历。
-
-**位置**: `fs/ext4/mballoc.c`
+## 六、多全局目标 (2025)
 
 ```c
-/* xarray 结构 */
-struct xarray s_mb_avg_fragment_size_order[MAX_ORDER];  /* 按平均碎片大小排序 */
-struct xarray s_mb_largest_free_orders[MAX_ORDER];      /* 按最大空闲长度排序 */
-
-/* xarray 索引 = 块组号, 值 = 块组信息 */
-/* 非空值表示该块组在列表中 */
+s_mb_nr_global_goals = min(num_possible_cpus(), total_groups / 4);
+goal_index = inode->i_ino % s_mb_nr_global_goals;
 ```
 
-### 4.2 优势
-
-| 特性 | 旧链表 | 新 xarray |
-|------|--------|-----------|
-| 遍历方式 | 需要 spin_lock | 无锁有序遍历 |
-| 忙组处理 | 无法跳过 | ext4_try_lock_group() 跳过 |
-| 插入/删除 | O(1) | O(1) |
-| 查找 | O(1) | O(nlogn) |
-| 多进程性能 | 差 (弹跳问题) | 好 (线性遍历) |
-
-### 4.3 查找函数
-
-```c
-/* 从指定位置开始在 xarray 中查找好组 */
-ext4_group_t ext4_mb_find_good_group_xarray(struct xarray *xa,
-                                            ext4_group_t start,
-                                            ext4_group_t ngroups);
-/* 到达 ngroups-1 后回绕到 0，再到 start-1，确保有序遍历 */
-```
+解决单一 `s_mb_last_group` 导致的竞争问题。
 
 ---
 
-## 五、多全局目标 (Multiple Global Goals)
+## 七、关键代码位置
 
-### 5.1 问题
-
-单一全局目标 (`s_mb_last_group`) 导致多进程竞争同一块组，降低 extent 合并概率，增加文件碎片。
-
-### 5.2 解决方案
-
-```c
-/* 全局目标数量 = min(可能CPU数, 总块组数/4) */
-s_mb_num_global_goals = min(num_possible_cpus(), total_groups / 4);
-
-/* 为每个 inode 选择固定目标 */
-goal_index = inode->i_ino % s_mb_num_global_goals;
-```
-
-### 5.3 性能提升
-
-| 平台 | 场景 | 旧 | 新 | 提升 |
-|------|------|----|----|------|
-| Kunpeng 920 | P80, mb_optimize_scan=0 | 9636 | 19628 | +103% |
-| AMD 9654*2 | P96, mb_optimize_scan=0 | 22341 | 53760 | +140% |
-| AMD 9654*2 | P96, mb_optimize_scan=1 | 9177 | 12716 | +38.5% |
-
----
-
-## 六、跳过忙组 (ext4_try_lock_group)
-
-### 6.1 概述
-
-当多个进程/容器执行相似分配模式时，会竞争同一块组。`ext4_try_lock_group()` 在组被锁定时跳过，避免竞争。
-
-```c
-int ext4_try_lock_group(struct ext4_buddy *e4b, struct ext4_group_info *grp);
-/* 返回 0 表示成功获取锁，-EBUSY 表示组忙应跳过 */
-```
-
-### 6.2 使用限制
-
-- `ac_criteria == CR_ANY_FREE` 时不跳过忙组 (确保能找到空闲块)
-- 仅在非线扫描时使用
-
-### 6.3 性能提升
-
-| 平台 | 场景 | 旧 | 新 | 提升 |
-|------|------|----|----|------|
-| AMD 9654*2 | P96, mb_optimize_scan=0 | 3450 | 15371 | +345% |
-| Kunpeng 920 | P80, mb_optimize_scan=0 | 2667 | 4821 | +80.7% |
-
----
-
-## 七、空闲 extent 合并优化
-
-### 7.1 概述
-
-在插入新的空闲 extent 前，先与已存在的空闲 extent 合并，减少锁持有次数。
-
-**旧流程**:
-```
-prev 合并到 new → 持锁
-next 合并到 new → 持锁
-插入 new → 持锁
-总计: 3次持锁
-```
-
-**新流程**:
-```
-new 合并到 next → 无锁
-next 合并到 prev → 持锁
-总计: 1次持锁
-```
-
----
-
-## 八、Mount 选项
-
-### 8.1 mb_optimize_scan
-
-```bash
-# 启用优化扫描 (默认启用)
-mount -o mb_optimize_scan /dev/sdX /mnt
-
-# 禁用优化扫描 (使用传统线性扫描)
-mount -o no_mb_optimize_scan /dev/sdX /mnt
-```
-
-**行为变化**:
-- 优化扫描对 indirect block inode 和 extent inode 都生效 (2026年变更)
-- 传统模式仅对 extent inode 生效
-
----
-
-## 九、关键代码位置
-
-| 功能 | 文件路径 |
-|------|----------|
-| 核心分配逻辑 | `fs/ext4/mballoc.c` |
-| Buddy 系统 | `fs/ext4/mballoc.c` |
-| 组选择/扫描 | `fs/ext4/mballoc.c` |
-| Xarray 管理 | `fs/ext4/mballoc.c` |
-| KUnit 测试 | `fs/ext4/mballoc-test.c` |
-| 头文件定义 | `fs/ext4/mballoc.h` |
-
----
-
-## 十、参考资源
-
-- ext4 官方文档: `Documentation/filesystems/ext4/`
-- ext4 内核代码: `fs/ext4/mballoc.c`
-- 补丁系列: "ext4: mballoc improvements" (2025)
+| 功能 | 文件 |
+|------|------|
+| 核心分配 | fs/ext4/mballoc.c |
+| Buddy 系统 | fs/ext4/mballoc.c |
+| 头文件 | fs/ext4/ext4.h (标志/结构) |

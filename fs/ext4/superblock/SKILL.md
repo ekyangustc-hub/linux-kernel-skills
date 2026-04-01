@@ -3,325 +3,286 @@ name: "ext4-superblock"
 description: "ext4文件系统超级块专家。当用户询问ext4超级块结构、s_magic、s_log_block_size、s_feature_incompat、文件系统参数时调用此技能。"
 ---
 
-# ext4 Super Block (超级块)
+# ext4 Super Block
 
-## 一、概述
+超级块是 ext4 文件系统的核心元数据结构，存储所有文件系统配置和运行时统计信息。
 
-超级块是 ext4 文件系统的核心结构，存储文件系统的元数据和配置信息。
+## 〇、为什么需要这个机制？
 
----
+为什么需要超级块？没有超级块，文件系统就不知道自己的大小、块大小、inode 数量等基本信息。超级块是文件系统的"身份证"。ext4 的超级块经历了多次扩展：从 ext2 的简单参数，到 ext3 的日志信息，再到 ext4 的 bigalloc/encrypt/fast_commit 等新特性参数。
 
-## 二、超级块位置
+超级块的设计面临一个根本矛盾：它包含的信息越来越多，但必须保持在一个块（通常 4K）内。解决方案是分阶段扩展：先利用保留字段，再添加高位扩展字段（如 s_blocks_count_hi），最后通过特性标志启用新字段。
 
-### 2.1 主超级块位置
-
-| 块大小 | 超级块起始字节 |
-|--------|---------------|
-| 1024 字节 | 字节 1024 (块 1) |
-| 2048 字节 | 字节 1024 (块 0 的后半部分) |
-| 4096 字节 | 字节 1024 (块 0 的后半部分) |
-
-### 2.2 备份超级块
-
-备份超级块位于特定的块组中，取决于 sparse_super 特性：
-
-```
-默认备份位置：块组 1, 3, 5, 7, 9, 25, 27, 29, 31, ...
-```
+没有超级块，挂载操作就无法进行——内核无法确认这是一个 ext4 文件系统，也无法知道如何解释磁盘上的其他结构。
 
 ---
 
-## 三、结构定义
-
-**位置**: `fs/ext4/ext4.h`
+## 一、结构定义 (verified: ext4.h:1332-1463)
 
 ```c
 struct ext4_super_block {
-    __le32  s_inodes_count;         /* inode 总数 */
-    __le32  s_blocks_count_lo;      /* 块总数 (低 32 位) */
-    __le32  s_r_blocks_count_lo;    /* 保留块数 (低 32 位) */
-    __le32  s_free_blocks_count_lo; /* 空闲块数 (低 32 位) */
-    __le32  s_free_inodes_count;    /* 空闲 inode 数 */
-    __le32  s_first_data_block;     /* 第一个数据块号 */
-    __le32  s_log_block_size;       /* 块大小 = 1024 << s_log_block_size */
-    __le32  s_log_cluster_size;     /* 簇大小 */
-    __le32  s_blocks_per_group;     /* 每组块数 */
-    __le32  s_clusters_per_group;   /* 每组簇数 */
-    __le32  s_inodes_per_group;     /* 每组 inode 数 */
-    __le32  s_mtime;                /* 最后挂载时间 */
-    __le32  s_wtime;                /* 最后写入时间 */
-    __le16  s_mnt_count;            /* 挂载计数 */
-    __le16  s_max_mnt_count;        /* 最大挂载计数 */
-    __le16  s_magic;                /* 魔数 0xEF53 */
-    __le16  s_state;                /* 文件系统状态 */
-    __le16  s_errors;               /* 错误处理方式 */
-    __le16  s_minor_rev_level;      /* 次版本号 */
-    __le32  s_lastcheck;            /* 最后检查时间 */
-    __le32  s_checkinterval;        /* 检查间隔 */
-    __le32  s_creator_os;           /* 创建操作系统 */
-    __le32  s_rev_level;            /* 版本号 */
-    __le16  s_def_resuid;           /* 默认保留 UID */
-    __le16  s_def_resgid;           /* 默认保留 GID */
-    __le32  s_first_ino;            /* 第一个非保留 inode */
-    __le16  s_inode_size;           /* inode 大小 */
-    __le16  s_block_group_nr;       /* 块组号 */
-    __le32  s_feature_compat;       /* 兼容特性 */
-    __le32  s_feature_incompat;     /* 不兼容特性 */
-    __le32  s_feature_ro_compat;    /* 只读兼容特性 */
-    __u8    s_uuid[16];             /* UUID */
-    char    s_volume_name[16];      /* 卷名 */
-    char    s_last_mounted[64];     /* 最后挂载点 */
-    __le32  s_algorithm_usage_bitmap;/* 算法位图 */
-    __u8    s_prealloc_blocks;      /* 预分配块数 */
-    __u8    s_prealloc_dir_blocks;  /* 目录预分配块数 */
-    __le16  s_reserved_gdt_blocks;  /* 保留 GDT 块数 */
-    __u8    s_journal_uuid[16];     /* 日志 UUID */
-    __le32  s_journal_inum;         /* 日志 inode */
-    __le32  s_journal_dev;          /* 日志设备 */
-    __le32  s_last_orphan;          /* 孤儿 inode 链表头 */
-    __le32  s_hash_seed[4];         /* HTREE 哈希种子 */
-    __u8    s_def_hash_version;     /* 默认哈希版本 */
-    __u8    s_jnl_backup_type;      /* 日志备份类型 */
-    __le16  s_desc_size;            /* 块组描述符大小 */
-    __le32  s_default_mount_opts;   /* 默认挂载选项 */
-    __le32  s_first_meta_bg;        /* 第一个 meta_bg */
-    __le32  s_mkfs_time;            /* 创建时间 */
-    __le32  s_jnl_blocks[17];       /* 日志备份 */
-    __le32  s_blocks_count_hi;      /* 块总数 (高 32 位) */
-    __le32  s_r_blocks_count_hi;    /* 保留块数 (高 32 位) */
-    __le32  s_free_blocks_count_hi; /* 空闲块数 (高 32 位) */
-    __le16  s_min_extra_isize;      /* 最小额外 inode 空间 */
-    __le16  s_want_extra_isize;     /* 期望额外 inode 空间 */
-    __le32  s_flags;                /* 标志 */
-    __le16  s_raid_stride;          /* RAID 步长 */
-    __le16  s_mmp_interval;         /* MMP 检查间隔 */
-    __le64  s_mmp_block;            /* MMP 块号 */
-    __le32  s_raid_stripe_width;    /* RAID 条带宽度 */
-    __u8    s_log_groups_per_flex;  /* flex_bg 大小 */
-    __u8    s_checksum_type;        /* 校验和类型 */
-    __le16  s_reserved_pad;         /* 保留 */
-    __le64  s_kbytes_written;       /* 写入字节数 */
-    __le32  s_snapshot_inum;        /* 快照 inode */
-    __le32  s_snapshot_id;          /* 快照 ID */
-    __le64  s_snapshot_r_blocks_count;/* 快照保留块 */
-    __le32  s_snapshot_list;        /* 快照链表 */
-    __le32  s_error_count;          /* 错误计数 */
-    __le32  s_first_error_time;     /* 第一次错误时间 */
-    __le32  s_first_error_ino;      /* 第一次错误 inode */
-    __le64  s_first_error_block;    /* 第一次错误块 */
-    __u8    s_first_error_func[32]; /* 第一次错误函数 */
-    __le32  s_first_error_line;     /* 第一次错误行号 */
-    __le32  s_last_error_time;      /* 最后错误时间 */
-    __le32  s_last_error_ino;       /* 最后错误 inode */
-    __le32  s_last_error_line;      /* 最后错误行号 */
-    __le64  s_last_error_block;     /* 最后错误块 */
-    __u8    s_last_error_func[32];  /* 最后错误函数 */
-    __u8    s_mount_opts[64];       /* 挂载选项 */
-    __le32  s_usr_quota_inum;       /* 用户配额 inode */
-    __le32  s_grp_quota_inum;       /* 组配额 inode */
-    __le32  s_overhead_blocks;      /* 开销块数 */
-    __le32  s_backup_bgs[2];        /* 备份块组 */
-    __u8    s_encrypt_algos[4];     /* 加密算法 */
-    __u8    s_encrypt_pw_salt[16];  /* 加密盐 */
-    __le32  s_lpf_ino;              /* lost+found inode */
-    __le32  s_prj_quota_inum;       /* 项目配额 inode */
-    __le32  s_checksum_seed;        /* 校验和种子 */
-    __le32  s_reserved[98];         /* 保留 */
-    __le32  s_checksum;             /* 校验和 */
+/*00*/	__le32	s_inodes_count;		/* Inodes count */
+	__le32	s_blocks_count_lo;	/* Blocks count */
+	__le32	s_r_blocks_count_lo;	/* Reserved blocks count */
+	__le32	s_free_blocks_count_lo;	/* Free blocks count */
+/*10*/	__le32	s_free_inodes_count;	/* Free inodes count */
+	__le32	s_first_data_block;	/* First Data Block */
+	__le32	s_log_block_size;	/* Block size */
+	__le32	s_log_cluster_size;	/* Allocation cluster size */
+/*20*/	__le32	s_blocks_per_group;	/* # Blocks per group */
+	__le32	s_clusters_per_group;	/* # Clusters per group */
+	__le32	s_inodes_per_group;	/* # Inodes per group */
+	__le32	s_mtime;		/* Mount time */
+/*30*/	__le32	s_wtime;		/* Write time */
+	__le16	s_mnt_count;		/* Mount count */
+	__le16	s_max_mnt_count;	/* Maximal mount count */
+	__le16	s_magic;		/* Magic signature */
+	__le16	s_state;		/* File system state */
+	__le16	s_errors;		/* Behaviour when detecting errors */
+	__le16	s_minor_rev_level;	/* minor revision level */
+/*40*/	__le32	s_lastcheck;		/* time of last check */
+	__le32	s_checkinterval;	/* max. time between checks */
+	__le32	s_creator_os;		/* OS */
+	__le32	s_rev_level;		/* Revision level */
+/*50*/	__le16	s_def_resuid;		/* Default uid for reserved blocks */
+	__le16	s_def_resgid;		/* Default gid for reserved blocks */
+	__le32	s_first_ino;		/* First non-reserved inode */
+	__le16  s_inode_size;		/* size of inode structure */
+	__le16	s_block_group_nr;	/* block group # of this superblock */
+	__le32	s_feature_compat;	/* compatible feature set */
+/*60*/	__le32	s_feature_incompat;	/* incompatible feature set */
+	__le32	s_feature_ro_compat;	/* readonly-compatible feature set */
+/*68*/	__u8	s_uuid[16];		/* 128-bit uuid for volume */
+/*78*/	char	s_volume_name[16];	/* volume name */
+/*88*/	char	s_last_mounted[64];	/* directory where last mounted */
+/*C8*/	__le32	s_algorithm_usage_bitmap; /* For compression */
+	__u8	s_prealloc_blocks;	/* Nr of blocks to try to preallocate*/
+	__u8	s_prealloc_dir_blocks;	/* Nr to preallocate for dirs */
+	__le16	s_reserved_gdt_blocks;	/* Per group desc for online growth */
+/*D0*/	__u8	s_journal_uuid[16];	/* uuid of journal superblock */
+/*E0*/	__le32	s_journal_inum;		/* inode number of journal file */
+	__le32	s_journal_dev;		/* device number of journal file */
+	__le32	s_last_orphan;		/* start of list of inodes to delete */
+	__le32	s_hash_seed[4];		/* HTREE hash seed */
+	__u8	s_def_hash_version;	/* Default hash version to use */
+	__u8	s_jnl_backup_type;
+	__le16  s_desc_size;		/* size of group descriptor */
+/*100*/	__le32	s_default_mount_opts;
+	__le32	s_first_meta_bg;	/* First metablock block group */
+	__le32	s_mkfs_time;		/* When the filesystem was created */
+	__le32	s_jnl_blocks[17];	/* Backup of the journal inode */
+	/* 64bit support valid if EXT4_FEATURE_INCOMPAT_64BIT */
+/*150*/	__le32	s_blocks_count_hi;
+	__le32	s_r_blocks_count_hi;
+	__le32	s_free_blocks_count_hi;
+	__le16	s_min_extra_isize;
+	__le16	s_want_extra_isize;
+	__le32	s_flags;
+	__le16  s_raid_stride;
+	__le16  s_mmp_update_interval;
+	__le64  s_mmp_block;
+	__le32  s_raid_stripe_width;
+	__u8	s_log_groups_per_flex;
+	__u8	s_checksum_type;
+	__u8	s_encryption_level;
+	__u8	s_reserved_pad;
+	__le64	s_kbytes_written;
+	__le32	s_snapshot_inum;
+	__le32	s_snapshot_id;
+	__le64	s_snapshot_r_blocks_count;
+	__le32	s_snapshot_list;
+	__le32	s_error_count;
+	__le32	s_first_error_time;
+	__le32	s_first_error_ino;
+	__le64	s_first_error_block;
+	__u8	s_first_error_func[32];
+	__le32	s_first_error_line;
+	__le32	s_last_error_time;
+	__le32	s_last_error_ino;
+	__le32	s_last_error_line;
+	__le64	s_last_error_block;
+	__u8	s_last_error_func[32];
+	__u8	s_mount_opts[64];
+	__le32	s_usr_quota_inum;
+	__le32	s_grp_quota_inum;
+	__le32	s_overhead_clusters;
+	__le32	s_backup_bgs[2];
+	__u8	s_encrypt_algos[4];
+	__u8	s_encrypt_pw_salt[16];
+	__le32	s_lpf_ino;
+	__le32	s_prj_quota_inum;
+	__le32	s_checksum_seed;
+	__u8	s_wtime_hi;
+	__u8	s_mtime_hi;
+	__u8	s_mkfs_time_hi;
+	__u8	s_lastcheck_hi;
+	__u8	s_first_error_time_hi;
+	__u8	s_last_error_time_hi;
+	__u8	s_first_error_errcode;
+	__u8    s_last_error_errcode;
+	__le16  s_encoding;		/* Filename charset encoding */
+	__le16  s_encoding_flags;	/* Filename charset encoding flags */
+	__le32  s_orphan_file_inum;	/* Inode for tracking orphan inodes */
+	__le16	s_def_resuid_hi;
+	__le16	s_def_resgid_hi;
+	__le32	s_reserved[93];		/* Padding to the end of the block */
+	__le32	s_checksum;		/* crc32c(superblock) */
 };
 ```
 
 ---
 
-## 四、关键字段详解
+## 二、关键字段
 
-### 4.1 基本参数
+### 2.1 基本参数
 
 | 字段 | 说明 |
 |------|------|
-| `s_magic` | 魔数，固定为 0xEF53 |
-| `s_log_block_size` | 块大小 = 1024 << s_log_block_size |
-| `s_blocks_per_group` | 每个块组的块数 |
-| `s_inodes_per_group` | 每个块组的 inode 数 |
-| `s_inode_size` | inode 大小，通常 256 字节 |
+| `s_magic` | 0xEF53 |
+| `s_log_block_size` | block_size = 1024 << s_log_block_size |
+| `s_log_cluster_size` | cluster_size (bigalloc), 0 表示等于 block_size |
+| `s_inode_size` | 通常 256 字节 |
+| `s_desc_size` | 32 (无 64bit) 或 64 (有 64bit) |
 
-### 4.2 块大小计算
+### 2.2 错误记录字段 (s_error_count 到 s_last_error_func)
 
 ```c
-/* 块大小计算 */
-block_size = 1024 << sb->s_log_block_size;
-
-/* 常见值 */
-s_log_block_size = 0  -> 1024 字节
-s_log_block_size = 1  -> 2048 字节
-s_log_block_size = 2  -> 4096 字节
+#define EXT4_S_ERR_START offsetof(struct ext4_super_block, s_error_count)
+#define EXT4_S_ERR_END   offsetof(struct ext4_super_block, s_mount_opts)
+#define EXT4_S_ERR_LEN   (EXT4_S_ERR_END - EXT4_S_ERR_START)
 ```
 
-### 4.3 文件系统状态
+包含: s_error_count, s_first_error_time, s_first_error_ino, s_first_error_block, s_first_error_func[32], s_first_error_line, s_last_error_time, s_last_error_ino, s_last_error_line, s_last_error_block, s_last_error_func[32]
+
+### 2.3 新增字段 (近年内核)
+
+| 字段 | 说明 |
+|------|------|
+| `s_orphan_file_inum` | 孤儿文件 inode 号 (COMPAT ORPHAN_FILE) |
+| `s_encoding` | 文件名编码 (UTF-8 12.1 = 1) |
+| `s_encoding_flags` | 编码标志 |
+| `s_def_resuid_hi` | 32-bit resuid 高16位 |
+| `s_def_resgid_hi` | 32-bit resgid 高16位 |
+| `s_first_error_errcode` | 首次错误 errno 代码 |
+| `s_last_error_errcode` | 最近错误 errno 代码 |
+| `s_reserved[93]` | 填充到块末尾 |
+
+### 2.4 32-bit UID/GID 访问
 
 ```c
-#define EXT4_VALID_FS           0x0001  /* 文件系统干净卸载 */
-#define EXT4_ERROR_FS           0x0002  /* 文件系统有错误 */
-#define EXT4_ORPHAN_FS          0x0004  /* 文件系统有孤儿 inode */
+static inline int ext4_get_resuid(struct ext4_super_block *es)
+{
+	return le16_to_cpu(es->s_def_resuid) |
+		le16_to_cpu(es->s_def_resuid_hi) << 16;
+}
 ```
 
 ---
 
-## 五、特性标志
-
-### 5.1 兼容特性 (s_feature_compat)
+## 三、文件系统状态
 
 ```c
-#define EXT4_FEATURE_COMPAT_DIR_PREALLOC    0x0001  /* 目录预分配 */
-#define EXT4_FEATURE_COMPAT_IMAGIC_INODES   0x0002  /* imagic inode */
-#define EXT4_FEATURE_COMPAT_HAS_JOURNAL     0x0004  /* 有日志 */
-#define EXT4_FEATURE_COMPAT_EXT_ATTR        0x0008  /* 扩展属性 */
-#define EXT4_FEATURE_COMPAT_RESIZE_INO      0x0010  /* resize inode */
-#define EXT4_FEATURE_COMPAT_DIR_INDEX       0x0020  /* 目录索引 */
+#define EXT4_VALID_FS		0x0001	/* Unmounted cleanly */
+#define EXT4_ERROR_FS		0x0002	/* Errors detected */
+#define EXT4_ORPHAN_FS		0x0004	/* Orphans being recovered */
+#define EXT4_FC_REPLAY		0x0020	/* Fast commit replay ongoing */
 ```
 
-### 5.2 不兼容特性 (s_feature_incompat)
+---
+
+## 四、错误代码 (ext4.h:1942-1958)
 
 ```c
-#define EXT4_FEATURE_INCOMPAT_COMPRESSION   0x0001  /* 压缩 */
-#define EXT4_FEATURE_INCOMPAT_FILETYPE      0x0002  /* 目录项有文件类型 */
-#define EXT4_FEATURE_INCOMPAT_RECOVER       0x0004  /* 需要恢复 */
-#define EXT4_FEATURE_INCOMPAT_JOURNAL_DEV   0x0008  /* 外部日志 */
-#define EXT4_FEATURE_INCOMPAT_META_BG       0x0010  /* meta_bg */
-#define EXT4_FEATURE_INCOMPAT_EXTENTS       0x0040  /* extent 树 */
-#define EXT4_FEATURE_INCOMPAT_64BIT         0x0080  /* 64 位 */
-#define EXT4_FEATURE_INCOMPAT_MMP           0x0100  /* MMP */
-#define EXT4_FEATURE_INCOMPAT_FLEX_BG       0x0200  /* flex_bg */
-#define EXT4_FEATURE_INCOMPAT_EA_INODE      0x0400  /* EA inode */
-#define EXT4_FEATURE_INCOMPAT_DIRDATA       0x1000  /* 目录数据 */
-#define EXT4_FEATURE_INCOMPAT_CSUM_SEED     0x2000  /* 校验和种子 */
-#define EXT4_FEATURE_INCOMPAT_LARGEDIR      0x4000  /* 大目录 */
-#define EXT4_FEATURE_INCOMPAT_INLINE_DATA   0x8000  /* 内联数据 */
-#define EXT4_FEATURE_INCOMPAT_ENCRYPT       0x10000 /* 加密 */
+#define EXT4_ERR_UNKNOWN	 1
+#define EXT4_ERR_EIO		 2
+#define EXT4_ERR_ENOMEM		 3
+#define EXT4_ERR_EFSBADCRC	 4
+#define EXT4_ERR_EFSCORRUPTED	 5
+#define EXT4_ERR_ENOSPC		 6
+#define EXT4_ERR_ENOKEY		 7
+#define EXT4_ERR_EROFS		 8
+#define EXT4_ERR_EFBIG		 9
+#define EXT4_ERR_EEXIST		10
+#define EXT4_ERR_ERANGE		11
+#define EXT4_ERR_EOVERFLOW	12
+#define EXT4_ERR_EBUSY		13
+#define EXT4_ERR_ENOTDIR	14
+#define EXT4_ERR_ENOTEMPTY	15
+#define EXT4_ERR_ESHUTDOWN	16
+#define EXT4_ERR_EFAULT		17
 ```
 
-### 5.3 只读兼容特性 (s_feature_ro_compat)
+---
+
+## 五、ext4_sb_info 关键字段 (ext4.h:1525-1800)
 
 ```c
-#define EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER 0x0001  /* 稀疏超级块 */
-#define EXT4_FEATURE_RO_COMPAT_LARGE_FILE   0x0002  /* 大文件 */
-#define EXT4_FEATURE_RO_COMPAT_BTREE_DIR    0x0004  /* B-tree 目录 */
-#define EXT4_FEATURE_RO_COMPAT_HUGE_FILE    0x0008  /* 巨大文件 */
-#define EXT4_FEATURE_RO_COMPAT_GDT_CSUM     0x0010  /* GDT 校验和 */
-#define EXT4_FEATURE_RO_COMPAT_DIR_NLINK    0x0020  /* 目录无限链接 */
-#define EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE  0x0040  /* 额外 inode 空间 */
-#define EXT4_FEATURE_RO_COMPAT_QUOTA        0x0100  /* 配额 */
-#define EXT4_FEATURE_RO_COMPAT_BIGALLOC     0x0200  /* bigalloc */
-#define EXT4_FEATURE_RO_COMPAT_METADATA_CSUM 0x0400 /* 元数据校验和 */
+struct ext4_sb_info {
+	/* 基本参数 */
+	unsigned long s_desc_size;
+	unsigned long s_blocks_per_group;
+	unsigned long s_clusters_per_group;
+	unsigned long s_inodes_per_group;
+	unsigned long s_itb_per_group;
+	unsigned long s_gdb_count;
+	unsigned long s_desc_per_block;
+	ext4_group_t s_groups_count;
+
+	/* bigalloc */
+	unsigned int s_cluster_ratio;
+	unsigned int s_cluster_bits;
+
+	/* 挂载选项 */
+	unsigned int s_mount_opt;
+	unsigned int s_mount_opt2;
+	unsigned long s_mount_flags;
+
+	/* 孤儿文件 */
+	struct ext4_orphan_info s_orphan_info;
+
+	/* mballoc xarray (2025) */
+	struct xarray *s_mb_avg_fragment_size;
+	struct xarray *s_mb_largest_free_orders;
+	unsigned int s_mb_nr_global_goals;
+
+	/* Fast commit */
+	struct list_head s_fc_q[2];
+	struct list_head s_fc_dentry_q[2];
+	struct mutex s_fc_lock;
+	unsigned int s_fc_bytes;
+	tid_t s_fc_ineligible_tid;
+
+	/* 错误跟踪 */
+	spinlock_t s_error_lock;
+	int s_first_error_code;
+	int s_last_error_code;
+
+	/* Atomic write */
+	unsigned int s_awu_min;
+	unsigned int s_awu_max;
+
+	/* Large folio */
+	u16 s_min_folio_order;
+	u16 s_max_folio_order;
+
+	/* ES shrinker */
+	struct shrinker *s_es_shrinker;
+	struct list_head s_es_list;
+	long s_es_nr_inode;
+
+	/* Errseq tracking */
+	errseq_t s_bdev_wb_err;
+	spinlock_t s_bdev_wb_lock;
+};
 ```
 
 ---
 
-## 六、mkfs 选项
+## 六、关键代码位置
 
-### 6.1 常用选项
-
-```bash
-# 基本格式化
-mkfs.ext4 /dev/sdX
-
-# 指定块大小
-mkfs.ext4 -b 4096 /dev/sdX
-
-# 指定 inode 大小
-mkfs.ext4 -I 256 /dev/sdX
-
-# 启用特性
-mkfs.ext4 -O extent,flex_bg,metadata_csum /dev/sdX
-
-# 禁用日志
-mkfs.ext4 -O ^has_journal /dev/sdX
-
-# 指定块组大小
-mkfs.ext4 -g 32768 /dev/sdX
-
-# 完整示例
-mkfs.ext4 -b 4096 -I 256 -O extent,flex_bg,metadata_csum,64bit /dev/sdX
-```
-
-### 6.2 mkfs 输出解读
-
-```
-mke2fs 1.45.5 (07-Jan-2020)
-Creating filesystem with 2621440 4k blocks and 655360 inodes
-Filesystem UUID: 12345678-1234-1234-1234-123456789abc
-Superblock backups stored on blocks:
-        32768, 98304, 163840, 229376, 294912, 819200, 884736, 1605632
-
-Allocating group tables: done
-Writing inode tables: done
-Creating journal (16384 blocks): done
-Writing superblocks and filesystem accounting information: done
-```
-
----
-
-## 七、调试命令
-
-### 7.1 dumpe2fs
-
-```bash
-# 查看超级块
-dumpe2fs /dev/sdX | head -100
-
-# 输出示例
-Filesystem volume name:   <none>
-Last mounted on:          /mnt
-Filesystem UUID:          12345678-1234-1234-1234-123456789abc
-Filesystem magic number:  0xEF53
-Filesystem revision #:    1 (dynamic)
-Filesystem features:      has_journal, extent, flex_bg, metadata_csum
-Filesystem flags:         signed_directory_hash
-Default mount options:    user_xattr acl
-Filesystem state:         clean
-Errors behavior:          Continue
-Filesystem OS type:       Linux
-Inode count:              655360
-Block count:              2621440
-Reserved block count:     131072
-Free blocks:              2490368
-Free inodes:              655349
-First block:              0
-Block size:               4096
-Fragment size:            4096
-Group descriptor size:    64
-Reserved GDT blocks:      1024
-Blocks per group:         32768
-Inodes per group:         8192
-Inode blocks per group:   512
-Flex block group size:    16
-```
-
-### 7.2 debugfs
-
-```bash
-debugfs /dev/sdX
-
-# 查看超级块
-debugfs: stats
-
-# 查看特性
-debugfs: features
-```
-
----
-
-## 八、代码位置
-
-| 功能 | 文件路径 |
-|------|----------|
-| 结构定义 | `fs/ext4/ext4.h` |
-| 超级块操作 | `fs/ext4/super.c` |
-| 超级块 I/O | `fs/ext4/super.c` |
-
----
-
-## 九、参考资源
-
-- ext4 官方文档: `Documentation/filesystems/ext4/`
-- ext4 内核代码: `fs/ext4/ext4.h`
+| 功能 | 文件 |
+|------|------|
+| 结构定义 | fs/ext4/ext4.h:1332-1463 |
+| 超级块读取/写入 | fs/ext4/super.c |
+| 挂载选项解析 | fs/ext4/super.c |
+| Mount API (fs_context) | fs/ext4/super.c |

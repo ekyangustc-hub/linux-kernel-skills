@@ -3,377 +3,214 @@ name: "ext4-directory"
 description: "ext4文件系统目录结构专家。当用户询问ext4目录项、HTREE索引、目录格式、目录操作时调用此技能。"
 ---
 
-# ext4 目录结构
+# ext4 Directory
 
-## 一、概述
+## 〇、为什么需要这个机制？
 
-ext4 支持多种目录格式，从小型线性目录到大型 HTREE 索引目录。
+为什么需要 HTREE 索引目录？线性搜索目录项的时间复杂度是 O(n)，大目录性能极差。HTREE 使用 B+ 树索引目录项，查找复杂度降为 O(log n)。ext4 支持 3 层 HTREE（largedir 特性），可容纳数千万目录项。加密+casefold 场景下，目录项需要存储哈希值，这是 HTREE 查找的基础。
 
----
+在 ext2 时代，目录只是一个线性列表的目录项。当目录包含数万个文件时，查找一个文件需要遍历整个目录，性能急剧下降。HTREE 的引入是 ext3 最重要的性能改进之一。
 
-## 二、目录格式
-
-### 2.1 格式类型
-
-| 格式 | 说明 | 适用场景 |
-|------|------|----------|
-| 线性目录 | 简单的目录项列表 | 小目录 |
-| HTREE 索引 | 哈希树索引 | 大目录 |
-
-### 2.2 格式判断
-
-```c
-/* 检查是否使用 HTREE 索引 */
-#define EXT4_INDEX_FL    0x00001000
-
-if (inode->i_flags & EXT4_INDEX_FL) {
-    /* 使用 HTREE 索引 */
-} else {
-    /* 线性目录 */
-}
-```
+没有 HTREE，现代 Linux 系统的 /usr、/var 等大型目录将无法高效运行，ls、find 等常用命令在大目录中会严重卡顿。
 
 ---
 
-## 三、目录项结构
-
-### 3.1 基本目录项
-
-**位置**: `fs/ext4/ext4.h`
+## 一、目录项结构 (verified: ext4.h:2396-2454)
 
 ```c
+#define EXT4_NAME_LEN 255
+
 struct ext4_dir_entry {
-    __le32  inode;          /* inode 号 */
-    __le16  rec_len;        /* 记录长度 */
-    __le16  name_len;       /* 文件名长度 */
-    char    name[EXT4_NAME_LEN]; /* 文件名 */
+	__le32	inode;
+	__le16	rec_len;
+	__le16	name_len;
+	char	name[EXT4_NAME_LEN];
 };
-```
 
-### 3.2 扩展目录项 (ext4_dir_entry_2)
-
-```c
 struct ext4_dir_entry_2 {
-    __le32  inode;          /* inode 号 */
-    __le16  rec_len;        /* 记录长度 */
-    __u8    name_len;       /* 文件名长度 */
-    __u8    file_type;      /* 文件类型 */
-    char    name[EXT4_NAME_LEN]; /* 文件名 */
+	__le32	inode;
+	__le16	rec_len;
+	__u8	name_len;
+	__u8	file_type;
+	char	name[EXT4_NAME_LEN];
+};
+
+/* Encrypted+casefolded entries need hash stored on disk */
+struct ext4_dir_entry_hash {
+	__le32 hash;
+	__le32 minor_hash;
+};
+
+struct ext4_dir_entry_tail {
+	__le32	det_reserved_zero1;
+	__le16	det_rec_len;		/* 12 */
+	__u8	det_reserved_zero2;
+	__u8	det_reserved_ft;	/* 0xDE */
+	__le32	det_checksum;
 };
 ```
 
-### 3.3 文件类型
+### 文件类型
 
-| 值 | 类型 |
-|----|------|
-| 0 | 未知 |
-| 1 | 普通文件 |
-| 2 | 目录 |
-| 3 | 字符设备 |
-| 4 | 块设备 |
-| 5 | FIFO |
-| 6 | Socket |
-| 7 | 符号链接 |
+```c
+#define EXT4_FT_UNKNOWN		0
+#define EXT4_FT_REG_FILE	1
+#define EXT4_FT_DIR		2
+#define EXT4_FT_CHRDEV		3
+#define EXT4_FT_BLKDEV		4
+#define EXT4_FT_FIFO		5
+#define EXT4_FT_SOCK		6
+#define EXT4_FT_SYMLINK		7
+#define EXT4_FT_MAX		8
+#define EXT4_FT_DIR_CSUM	0xDE	/* fake type for dir tail */
+```
 
 ---
 
-## 四、线性目录
+## 二、Encrypted+Casefolded 目录项
 
-### 4.1 布局
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      线性目录块                              │
-├─────────────────────────────────────────────────────────────┤
-│  entry[0]: inode=2, name=".", rec_len=12                    │
-│  entry[1]: inode=2, name="..", rec_len=12                   │
-│  entry[2]: inode=12, name="lost+found", rec_len=20          │
-│  entry[3]: inode=131, name="file1.txt", rec_len=16          │
-│  ...                                                        │
-│  unused: inode=0, rec_len=剩余空间                          │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 4.2 目录项查找
+当目录同时启用加密和 casefold 时，目录项末尾附加哈希值:
 
 ```c
-/* 线性查找 */
-struct ext4_dir_entry_2 *
-ext4_find_entry_linear(struct inode *dir, const struct qstr *name)
+static inline bool ext4_hash_in_dirent(const struct inode *inode)
 {
-    struct ext4_dir_entry_2 *de;
-    struct buffer_head *bh;
-    char *dir_data;
+	return IS_CASEFOLDED(inode) && IS_ENCRYPTED(inode);
+}
 
-    /* 读取目录数据块 */
-    bh = ext4_bread(NULL, dir, 0, 0);
+#define EXT4_DIRENT_HASHES(entry) \
+	((struct ext4_dir_entry_hash *) \
+		(((void *)(entry)) + \
+		((8 + (entry)->name_len + EXT4_DIR_ROUND) & ~EXT4_DIR_ROUND)))
+#define EXT4_DIRENT_HASH(entry) le32_to_cpu(EXT4_DIRENT_HASHES(entry)->hash)
+#define EXT4_DIRENT_MINOR_HASH(entry) \
+		le32_to_cpu(EXT4_DIRENT_HASHES(entry)->minor_hash)
+```
 
-    /* 线性扫描 */
-    dir_data = bh->b_data;
-    while ((char *)de < dir_data + dir->i_sb->s_blocksize) {
-        if (de->inode != 0 &&
-            de->name_len == name->len &&
-            !memcmp(de->name, name->name, name->len)) {
-            return de;  /* 找到 */
-        }
-        de = (struct ext4_dir_entry_2 *)((char *)de + de->rec_len);
-    }
+### rec_len 计算
 
-    return NULL;  /* 未找到 */
+```c
+static inline unsigned int ext4_dir_rec_len(__u8 name_len,
+						const struct inode *dir)
+{
+	int rec_len = (name_len + 8 + EXT4_DIR_ROUND);
+	if (dir && ext4_hash_in_dirent(dir))
+		rec_len += sizeof(struct ext4_dir_entry_hash);
+	return (rec_len & ~EXT4_DIR_ROUND);
 }
 ```
 
 ---
 
-## 五、HTREE 索引
+## 三、HTREE 索引目录
 
-### 5.1 概述
-
-HTREE (Hash Tree) 是一种基于哈希的目录索引结构，用于加速大目录的查找。
-
-### 5.2 HTREE 结构
-
-```
-                    ┌─────────────┐
-                    │  Root Node  │ (在 inode 内)
-                    │  dx_root    │
-                    └──────┬──────┘
-                           │
-           ┌───────────────┼───────────────┐
-           │               │               │
-           ▼               ▼               ▼
-    ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
-    │ Index Node  │ │ Index Node  │ │ Index Node  │
-    │ dx_node     │ │ dx_node     │ │ dx_node     │
-    └──────┬──────┘ └──────┬──────┘ └──────┬──────┘
-           │               │               │
-           ▼               ▼               ▼
-    ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
-    │ Data Block  │ │ Data Block  │ │ Data Block  │
-    │ 目录项      │ │ 目录项      │ │ 目录项      │
-    └─────────────┘ └─────────────┘ └─────────────┘
-```
-
-### 5.3 HTREE 节点结构
+### 3.1 哈希版本
 
 ```c
-/* HTREE 根节点 */
-struct dx_root {
-    struct fake_dirent dot;
-    struct fake_dirent dotdot;
-    struct dx_root_info info;
-    struct dx_entry entries[0];
+#define DX_HASH_LEGACY			0
+#define DX_HASH_HALF_MD4		1
+#define DX_HASH_TEA			2
+#define DX_HASH_LEGACY_UNSIGNED		3
+#define DX_HASH_HALF_MD4_UNSIGNED	4
+#define DX_HASH_TEA_UNSIGNED		5
+#define DX_HASH_SIPHASH			6	/* casefold+encrypted */
+```
+
+### 3.2 HTREE 级别
+
+```c
+#define	EXT4_HTREE_LEVEL_COMPAT	2	/* 无 largedir */
+#define	EXT4_HTREE_LEVEL	3	/* 有 largedir */
+
+static inline int ext4_dir_htree_level(struct super_block *sb)
+{
+	return ext4_has_feature_largedir(sb) ?
+		EXT4_HTREE_LEVEL : EXT4_HTREE_LEVEL_COMPAT;
+}
+```
+
+### 3.3 HTREE 根节点布局
+
+```
+Block 0 (root):
+┌───────────────────────────────────────────────────────┐
+│ "." entry (ext4_dir_entry_2)                          │
+│ ".." entry (ext4_dir_entry_2)                         │
+│ dx_root_info:                                         │
+│   reserved_zero (4 bytes)                             │
+│   hash_version (1 byte)                               │
+│   info_length (1 byte, = 8)                           │
+│   indirect_levels (1 byte)                            │
+│   unused_flags (1 byte)                               │
+│ dx_entry[]:                                           │
+│   { hash, block } × N                                 │
+└───────────────────────────────────────────────────────┘
+```
+
+### 3.4 HTREE 内部节点
+
+```
+Internal/Leaf Block:
+┌───────────────────────────────────────────────────────┐
+│ fake_dirent:                                          │
+│   inode=0, rec_len=blocksize, name_len=0, ft=0xDE    │
+│ (如果是内部节点) dx_entry[]: { hash, block } × N       │
+│ (如果是叶子节点) ext4_dir_entry_2[] × N                │
+│ ext4_dir_entry_tail (metadata_csum)                   │
+└───────────────────────────────────────────────────────┘
+```
+
+---
+
+## 四、目录操作
+
+### 4.1 判断是否 HTREE
+
+```c
+#define is_dx(dir) (ext4_has_feature_dir_index((dir)->i_sb) && \
+		    ext4_test_inode_flag((dir), EXT4_INODE_INDEX))
+```
+
+### 4.2 HTREE EOF
+
+```c
+#define EXT4_HTREE_EOF_32BIT   ((1UL  << (32 - 1)) - 1)
+#define EXT4_HTREE_EOF_64BIT   ((1ULL << (64 - 1)) - 1)
+```
+
+### 4.3 目录项填充
+
+```c
+#define EXT4_DIR_PAD			4
+#define EXT4_DIR_ROUND			(EXT4_DIR_PAD - 1)
+#define EXT4_MAX_REC_LEN		((1<<16)-1)
+```
+
+---
+
+## 五、readdir 私有数据
+
+```c
+struct dir_private_info {
+	struct rb_root	root;
+	struct rb_node	*curr_node;
+	struct fname	*extra_fname;
+	loff_t		last_pos;
+	__u32		curr_hash;
+	__u32		curr_minor_hash;
+	__u32		next_hash;
+	u64		cookie;
+	bool		initialized;
 };
-
-/* HTREE 索引节点 */
-struct dx_node {
-    struct fake_dirent fake;
-    struct dx_entry entries[0];
-};
-
-/* 索引条目 */
-struct dx_entry {
-    __le32 hash;        /* 哈希值 */
-    __le32 block;       /* 数据块号 */
-};
-```
-
-### 5.4 HTREE 查找
-
-```c
-/* HTREE 查找 */
-struct ext4_dir_entry_2 *
-ext4_find_entry_htree(struct inode *dir, const struct qstr *name)
-{
-    struct dx_frame frame;
-    u32 hash;
-
-    /* 1. 计算哈希值 */
-    hash = ext4_htree_hash(name->name, name->len);
-
-    /* 2. 从根节点开始查找 */
-    dx_probe(hash, dir, &frame);
-
-    /* 3. 遍历索引节点 */
-    while (frame.entries <= frame.at) {
-        /* 读取下一个索引块 */
-        dx_get_block(frame.at);
-    }
-
-    /* 4. 在数据块中查找 */
-    return ext4_search_dirblock(frame.bh, name);
-}
 ```
 
 ---
 
-## 六、哈希函数
+## 六、关键代码位置
 
-### 6.1 哈希版本
-
-```c
-#define DX_HASH_LEGACY          0   /* 传统哈希 */
-#define DX_HASH_HALF_MD4        1   /* 半 MD4 */
-#define DX_HASH_TEA             2   /* TEA */
-#define DX_HASH_LEGACY_UNSIGNED 3   /* 传统无符号 */
-#define DX_HASH_HALF_MD4_UNSIGNED 4 /* 半 MD4 无符号 */
-#define DX_HASH_TEA_UNSIGNED    5   /* TEA 无符号 */
-#define DX_HASH_SIPHASH         6   /* SipHash */
-```
-
-### 6.2 哈希计算
-
-```c
-/* 计算文件名哈希值 */
-u32 ext4_htree_hash(const char *name, int len)
-{
-    struct dx_hash_info hinfo;
-
-    hinfo.hash_version = DX_HASH_HALF_MD4;
-    hinfo.seed = EXT4_SB(dir->i_sb)->s_hash_seed;
-
-    ext4fs_dirhash(name, len, &hinfo);
-
-    return hinfo.hash;
-}
-```
-
----
-
-## 七、目录操作
-
-### 7.1 内联目录转换重构
-
-```c
-/* ext4: refactor the inline directory conversion and new directory codepaths */
-/* 重构内联目录转换和新目录代码路径 */
-/* 统一处理逻辑，减少代码重复 */
-```
-
-### 7.2 Large Block Size 支持
-
-```c
-/* ext4: support large block size in ext4_readdir() */
-/* 目录读取现在支持大块大小 */
-
-/* ext4: remove PAGE_SIZE checks for rec_len conversion */
-/* 移除 rec_len 转换中的 PAGE_SIZE 检查 */
-
-/* ext4: remove page offset calculation in ext4_block_truncate_page() */
-/* ext4: remove page offset calculation in ext4_block_zero_page_range() */
-/* 移除页偏移计算，使用 folio 替代 */
-```
-
-### 7.3 添加目录项
-
-```c
-int ext4_add_entry(handle_t *handle, struct dentry *dentry,
-                   struct inode *inode)
-{
-    struct inode *dir = dentry->d_parent->d_inode;
-
-    /* 1. 查找空闲位置 */
-    de = ext4_find_entry_free(dir, &bh);
-
-    /* 2. 创建目录项 */
-    de->inode = cpu_to_le32(inode->i_ino);
-    de->name_len = dentry->d_name.len;
-    de->file_type = ext4_file_type(inode->i_mode);
-    memcpy(de->name, dentry->d_name.name, dentry->d_name.len);
-
-    /* 3. 标记为脏 */
-    ext4_mark_inode_dirty(handle, dir);
-
-    return 0;
-}
-```
-
-### 7.2 删除目录项
-
-```c
-int ext4_delete_entry(handle_t *handle, struct inode *dir,
-                      struct ext4_dir_entry_2 *de,
-                      struct buffer_head *bh)
-{
-    /* 1. 找到前一个目录项 */
-    prev_de = ext4_find_prev_entry(dir, de);
-
-    /* 2. 合并空间 */
-    prev_de->rec_len += de->rec_len;
-    de->inode = 0;
-
-    /* 3. 标记为脏 */
-    ext4_handle_dirty_metadata(handle, dir, bh);
-
-    return 0;
-}
-```
-
----
-
-## 八、内联数据目录
-
-### 8.1 概述
-
-当目录很小时，目录数据可以内联存储在 inode 中。
-
-### 8.2 布局
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        Inode                                │
-├─────────────────────────────────────────────────────────────┤
-│  i_block[0-59]: 内联目录数据                                 │
-│  entry[0]: inode=2, name="."                                │
-│  entry[1]: inode=2, name=".."                               │
-│  entry[2]: inode=..., name="..."                            │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 九、调试命令
-
-### 9.1 debugfs
-
-```bash
-debugfs /dev/sdX
-
-# 查看目录内容
-debugfs: ls -l <目录inode>
-
-# 输出示例
-  2  40755 (2)      0      0    4096 28-Oct-2020 10:30 .
-  2  40755 (2)      0      0    4096 28-Oct-2020 10:30 ..
- 11  40700 (2)      0      0   16384 28-Oct-2020 10:30 lost+found
-131 100644 (1)      0      0       0 28-Oct-2020 10:30 file1.txt
-
-# 查看 HTREE 索引
-debugfs: htree <目录inode>
-```
-
-### 9.2 查看 HTREE 信息
-
-```bash
-# 使用 stat 查看目录标志
-debugfs: stat <目录inode>
-# 查看 Flags: 0x1000 表示使用 HTREE
-```
-
----
-
-## 十、代码位置
-
-| 功能 | 文件路径 |
-|------|----------|
-| 结构定义 | `fs/ext4/ext4.h` |
-| 目录操作 | `fs/ext4/dir.c` |
-| HTREE 索引 | `fs/ext4/namei.c` |
-| 内联数据 | `fs/ext4/inline.c` |
-
----
-
-## 十一、参考资源
-
-- ext4 官方文档: `Documentation/filesystems/ext4/`
-- ext4 内核代码: `fs/ext4/dir.c`
+| 功能 | 文件 |
+|------|------|
+| 结构定义 | fs/ext4/ext4.h:2396-2454 |
+| 目录操作 | fs/ext4/dir.c |
+| 名称查找 | fs/ext4/namei.c |
+| HTREE 实现 | fs/ext4/namei.c |
+| 哈希计算 | fs/ext4/hash.c |
