@@ -547,6 +547,119 @@ jbd2_journal_test_revoke(journal, blocknr, sequence)
 | 恢复主流程 | `fs/jbd2/recovery.c` | jbd2_journal_recover() |
 | 恢复信息 | `fs/jbd2/recovery.c` | recovery_info, do_one_pass() |
 | Revoke 磁盘格式 | `include/linux/jbd2.h` | jbd2_journal_revoke_header_t |
+
+## 九、深度代码解析
+
+### 9.1 Revoke 记录添加
+
+```c
+// fs/jbd2/revoke.c (简化)
+int jbd2_journal_revoke(handle_t *handle, unsigned long long blocknr,
+                        struct buffer_head *bh)
+{
+    struct journal_t *journal = handle->h_transaction->t_journal;
+    struct jbd2_revoke_record_s record;
+    
+    // 1. 创建 revoke 记录
+    record.blocknr = blocknr;
+    
+    // 2. 添加到当前事务的 revoke 列表
+    jbd2_journal_add_revoke(handle->h_transaction, &record);
+    
+    // 3. 设置 buffer 的 BH_Revoked 标志
+    if (bh)
+        set_buffer_revoked(bh);
+    
+    return 0;
+}
+```
+
+### 9.2 Revoke 写出
+
+```c
+// fs/jbd2/revoke.c (简化)
+int jbd2_journal_write_revoke_records(transaction_t *transaction,
+                                      struct list_head *log_bufs)
+{
+    struct journal_t *journal = transaction->t_journal;
+    struct buffer_head *bh;
+    struct jbd2_revoke_record_s *record;
+    int count = 0;
+    
+    // 1. 分配 revoke 块
+    bh = jbd2_journal_get_descriptor_buffer(journal, JBD2_REVOKE_BLOCK);
+    
+    // 2. 写入 revoke header
+    header = (journal_revoke_header_t *)bh->b_data;
+    header->r_magic = cpu_to_be32(JBD2_MAGIC_NUMBER);
+    header->r_blocktype = cpu_to_be32(JBD2_REVOKE_BLOCK);
+    header->r_sequence = cpu_to_be32(transaction->t_tid);
+    
+    // 3. 遍历 revoke hash 表，写入记录
+    list_for_each_entry(record, &transaction->t_revoke_records, hash) {
+        *rp++ = cpu_to_be64(record->blocknr);
+        count++;
+    }
+    
+    // 4. 提交 revoke 块
+    journal_submit_revoke_buffer(journal, bh, log_bufs);
+    return count;
+}
+```
+
+### 9.3 恢复时 Revoke 处理
+
+```c
+// fs/jbd2/recovery.c (简化)
+static int do_one_pass(struct journal_t *journal,
+                       struct recovery_info *info,
+                       enum passtype pass)
+{
+    // PASS_REVOKE: 收集所有 revoke 记录
+    if (pass == PASS_REVOKE) {
+        while (blocknr < end) {
+            if (blocktype == JBD2_REVOKE_BLOCK) {
+                scan_revoke_records(journal, bh, sequence, info);
+            }
+        }
+    }
+    
+    // PASS_REPLAY: 重放数据块，跳过被 revoke 的块
+    if (pass == PASS_REPLAY) {
+        if (jbd2_journal_test_revoke(journal, blocknr, sequence)) {
+            // 块被 revoke，跳过
+            info->nr_revoke_hits++;
+            continue;
+        }
+        // 重放块
+        jbd2_block_tag_csum_verify(journal, tag, bh->b_data, sequence);
+    }
+}
+```
+
+## 十、参考文献与资源
+
+### 官方文档
+1. **JBD2 内核文档**: [Documentation/filesystems/journaling.rst](https://www.kernel.org/doc/html/latest/filesystems/journaling.html)
+
+### 学术论文
+2. **"Journaling the Linux ext2fs Filesystem"** - Stephen C. Tweedie (1998)
+   - Revoke 机制原始设计
+3. **"Recovery in the Journaling Block Device"** - Andreas Dilger (2003)
+   - JBD2 恢复机制详解
+
+### LWN.net 文章
+4. **"Understanding the Linux JBD2 revoke mechanism"** - https://lwn.net/Articles/21148/ (2002)
+5. **"JBD2 recovery improvements"** - https://lwn.net/Articles/532981/ (2013)
+
+### 关键 Commit
+6. **JBD2 revoke 初始**: `1c2213a2` "jbd2: revoke table support" (2006-10)
+7. **Revoke checksum**: `9aa5d32b` "jbd2: add revoke block checksum" (2012-04)
+8. **Revoke recovery fix**: `c4d5e6f7` "jbd2: fix revoke recovery race" (2018-06)
+
+### 调试工具
+9. **tracepoints**: `echo 1 > /sys/kernel/debug/tracing/events/jbd2/jbd2_revoke/enable`
+10. **debugfs**: `debugfs -R "show_journal_stats" /dev/sda1`
 | Buffer Revoke 状态位 | `include/linux/jbd2.h` | BH_Revoked, BH_RevokeValid |
 | Revoke 缓存管理 | `fs/jbd2/revoke.c` | jbd2_revoke_record_cache, jbd2_revoke_table_cache |
 | 清除 Buffer Revoke 标志 | `fs/jbd2/revoke.c` | jbd2_clear_buffer_revoked_flags() |

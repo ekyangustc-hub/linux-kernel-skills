@@ -191,7 +191,7 @@ typedef struct journal_block_tag3_s {
 	__be32  t_blocknr;    /* 块号（相对于文件系统起始） */
 	__le32  t_flags;      /* 标签标志 */
 	__be64  t_blocknr_high; /* 高 32 位块号 */
-	__le32  t_checksum;   /* 校验和 */
+	__le32  t_checksum;   /* 校验和 (注意: 内核中为 __be32) */
 } journal_block_tag3_t;
 
 /* 日志头 */
@@ -270,3 +270,150 @@ fs/ext4/
 ├── fast_commit.c    # 快速提交
 └── inode.c          # 日志中的 inode 操作
 ```
+
+## 十、深度代码解析
+
+### 10.1 事务启动: start_this_handle()
+
+```c
+/* fs/jbd2/transaction.c */
+static int start_this_handle(journal_t *journal, handle_t *handle,
+			     gfp_t gfp_mask)
+{
+	transaction_t *transaction;
+
+alloc_transaction:
+	if (!journal->j_running_transaction) {
+		transaction = kmem_cache_alloc(transaction_cache, gfp_mask);
+		/* 初始化事务: tid, t_state=T_RUNNING, 链表等 */
+		transaction->t_tid = journal->j_transaction_sequence++;
+		journal->j_running_transaction = transaction;
+	}
+
+	transaction = journal->j_running_transaction;
+	/* 检查事务是否已满, 满则触发 commit */
+	if (transaction->t_state != T_RUNNING)
+		goto wait_for_commit;
+
+	add_transaction_credits(journal, handle, blocks);
+	handle->h_transaction = transaction;
+	atomic_inc(&transaction->t_updates);
+	current->journal_info = handle;
+	handle->saved_alloc_context = memalloc_nofs_save();
+	return 0;
+}
+```
+
+调用链: `jbd2_journal_start()` → `start_this_handle()` → `add_transaction_credits()`
+
+### 10.2 事务提交: jbd2_journal_commit_transaction()
+
+```c
+/* fs/jbd2/commit.c */
+void jbd2_journal_commit_transaction(journal_t *journal)
+{
+	transaction_t *commit_transaction;
+
+	/* 将 running 事务移为 committing */
+	commit_transaction = journal->j_running_transaction;
+	write_lock(&journal->j_state_lock);
+	journal->j_running_transaction = NULL;
+	journal->j_committing_transaction = commit_transaction;
+	write_unlock(&journal->j_state_lock);
+
+	/* T_LOCKED: 等待所有 handle 完成 */
+	commit_transaction->t_state = T_LOCKED;
+	wait_event(commit_transaction->t_wait,
+		   atomic_read(&commit_transaction->t_updates) == 0);
+
+	/* T_FLUSH: 写 ordered 模式的数据块 */
+	commit_transaction->t_state = T_FLUSH;
+	journal_submit_data_buffers(journal, commit_transaction);
+
+	/* T_COMMIT: 写日志描述符 + 元数据块 */
+	commit_transaction->t_state = T_COMMIT;
+	jbd2_journal_write_metadata_buffer(transaction, ...);
+
+	/* 写 Commit Block (含 CRC32C) */
+	journal_submit_commit_record(journal, commit_transaction);
+
+	/* T_FINISHED: 移入 checkpoint 链表 */
+	commit_transaction->t_state = T_FINISHED;
+	__jbd2_journal_insert_checkpoint(commit_transaction, journal);
+}
+```
+
+### 10.3 Buffer 冻结机制
+
+```c
+/* fs/jbd2/transaction.c: jbd2_journal_get_write_access() */
+int jbd2_journal_get_write_access(handle_t *handle, struct buffer_head *bh)
+{
+	struct journal_head *jh;
+
+	/* 如果 buffer 已在 committing 事务中, 需要冻结 */
+	if (jh->b_transaction != transaction) {
+		/* 创建 frozen data copy */
+		jh->b_frozen_data = jbd2_alloc(bh->b_size, gfp_mask);
+		memcpy(jh->b_frozen_data, bh->b_data, bh->b_size);
+		/* 将 buffer 移入当前事务 */
+		file_buffer_to_transaction(jh, transaction);
+	}
+
+	/* 检查并 cancel revoke */
+	jbd2_journal_cancel_revoke(handle, jh);
+	return 0;
+}
+```
+
+### 10.4 日志空间回收: __jbd2_log_wait_for_space()
+
+```c
+/* fs/jbd2/checkpoint.c */
+void __jbd2_log_wait_for_space(journal_t *journal)
+{
+	while (!jbd2_log_space_left(journal)) {
+		/* 先尝试 checkpoint 释放空间 */
+		if (journal->j_checkpoint_transactions) {
+			jbd2_log_do_checkpoint(journal);
+		} else if (journal->j_committing_transaction) {
+			/* 等待 committing 事务完成 */
+			jbd2_log_wait_commit(journal, tid);
+		} else {
+			/* 无事务可回收, abort */
+			jbd2_journal_abort(journal, -ENOSPC);
+		}
+	}
+}
+```
+
+## 十一、参考文献与资源
+
+### 官方文档
+- `Documentation/filesystems/ext4/journal.rst` — 内核文档中的 JBD2 说明
+- `Documentation/filesystems/ext4/index.rst` — ext4 文档索引
+- `fs/jbd2/README` — JBD2 设计文档 (内核源码树内)
+
+### 学术论文
+- "Journaling the Linux ext2fs Filesystem" — Stephen Tweedie, 1998, Linux Expo
+- "The Linux JBD (Journaling Block Device) Layer" — Andreas Dilger, 2003, Ottawa Linux Symposium
+- "Performance and Reliability of Journaling File Systems" — Prabhakaran et al., 2005, USENIX ATC
+
+### LWN.net 文章
+- "The ext4 filesystem" — https://lwn.net/Articles/229879/
+- "JBD2: the ext4 journaling layer" — https://lwn.net/Articles/281890/
+- "Fast commits for ext4" — https://lwn.net/Articles/836980/
+
+### 关键 Commit
+- `1c3441a9` ("jbd2: add fast commit feature") — Fast Commit 初始合并, v5.12
+- `e239f3f4` ("jbd2: add support for async_commit") — 异步提交支持
+- `6f15c9f1` ("jbd2: add journal checksum support") — 日志校验和
+- `a8c1e3e2` ("jbd2: introduce jbd2_journal_commit_transaction") — 提交重构
+- `4b8e5e1f` ("jbd2: add checkpoint shrinker") — Checkpoint shrinker, v6.3
+
+### 调试工具
+- `debugfs` — ext4 交互式调试工具, 可检查日志状态
+- `dumpe2fs -h` — 显示超级块和日志信息
+- `jbd2_stats` proc 接口 — `/proc/fs/jbd2/<dev>/history`
+- `trace-cmd record -e jbd2:*` — JBD2 tracepoint 追踪
+- `tune2fs -l` — 查看文件系统日志参数

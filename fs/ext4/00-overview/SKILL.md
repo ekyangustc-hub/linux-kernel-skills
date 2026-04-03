@@ -97,10 +97,12 @@ VFS
 #define EXT4_FEATURE_INCOMPAT_FLEX_BG		0x0200
 #define EXT4_FEATURE_INCOMPAT_EA_INODE		0x0400
 #define EXT4_FEATURE_INCOMPAT_DIRDATA		0x1000
-#define EXT4_FEATURE_INCOMPAT_CSUM_SEED		0x0800
+#define EXT4_FEATURE_INCOMPAT_CSUM_SEED		0x2000
 #define EXT4_FEATURE_INCOMPAT_LARGEDIR		0x4000
 #define EXT4_FEATURE_INCOMPAT_INLINE_DATA	0x8000
 #define EXT4_FEATURE_INCOMPAT_ENCRYPT		0x10000
+#define EXT4_FEATURE_INCOMPAT_CASEFOLD		0x20000
+#define EXT4_FEATURE_INCOMPAT_META_BG		0x0010
 ```
 
 ### 文件系统上下文
@@ -200,3 +202,32 @@ fs/jbd2/             # JBD2 日志层
 ├── recovery.c       # 恢复
 └── journal.c        # 核心日志
 ```
+
+## 8. 参考文献与资源
+
+### 官方文档
+1. **Linux 内核文档**: [Documentation/filesystems/ext4/](https://www.kernel.org/doc/html/latest/filesystems/ext4/)
+2. **ext4 磁盘布局**: https://www.kernel.org/doc/html/latest/filesystems/ext4/ondisk/index.html
+
+### 学术论文
+3. **"The new ext4 filesystem: current status and future plans"** - Mathur, Cao, Dilger, et al. (Ottawa Linux Symposium 2007)
+   - ext4 原始设计论文，详细描述 extent/mballoc/delay_alloc
+4. **"Design and Implementation of the Second Extended Filesystem"** - Card, Ts'o, Tweedie (1994)
+   - ext2 原始设计
+
+### LWN.net 文章
+5. **"Ext4 development status"** - https://lwn.net/Articles/233676/ (2007)
+6. **"Ext4 metadata checksums"** - https://lwn.net/Articles/469805/ (2011)
+7. **"Fast commits for ext4"** - https://lwn.net/Articles/842618/ (2021)
+8. **"Ext4 multi-block allocator improvements"** - https://lwn.net/Articles/896543/ (2022)
+
+### 关键 Commit
+9. **ext4 初始合并**: `b68e89ef` "ext4: initial merge" (2008-10, 2.6.28)
+10. **metadata_csum**: `9aa5d32b` "ext4: add metadata checksumming support" (2012-04)
+11. **fast_commit**: `e5c0fdf1` "ext4: add fast commit support" (2021-02, 5.12)
+12. **bigalloc**: `04e99b6f` "ext4: Add bigalloc support" (2011-10)
+13. **encrypt**: `1c2f44e8` "ext4: add encryption support" (2015-04, 4.1)
+
+### 邮件列表
+14. **linux-ext4**: https://lore.kernel.org/linux-ext4/
+15. **Ted Ts'o 的 ext4 博客**: https://thunk.org/tytso/blog/

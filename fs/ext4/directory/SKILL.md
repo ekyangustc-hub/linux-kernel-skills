@@ -214,3 +214,149 @@ struct dir_private_info {
 | 名称查找 | fs/ext4/namei.c |
 | HTREE 实现 | fs/ext4/namei.c |
 | 哈希计算 | fs/ext4/hash.c |
+
+---
+
+## 七、深度代码解析
+
+### 7.1 目录项查找算法
+
+```c
+// fs/ext4/namei.c (简化)
+static struct buffer_head *ext4_find_entry(struct inode *dir,
+                                           const struct qstr *d_name,
+                                           struct ext4_dir_entry_2 **res_dir)
+{
+    // 检查是否使用 HTREE 索引
+    if (is_dx(dir)) {
+        // HTREE 查找: O(log n)
+        return ext4_dx_find_entry(dir, d_name, res_dir);
+    }
+    
+    // 线性查找: O(n)
+    for (block = 0; block < nblocks; block++) {
+        bh = ext4_read_dirblock(dir, block, DIRENT);
+        de = (struct ext4_dir_entry_2 *)bh->b_data;
+        
+        while ((char *)de < bh->b_data + bh->b_size) {
+            if (ext4_match(dir, d_name, de)) {
+                *res_dir = de;
+                return bh;
+            }
+            de = ext4_next_entry(de, bh->b_size);
+        }
+    }
+    return NULL;
+}
+```
+
+### 7.2 HTREE 哈希计算
+
+```c
+// fs/ext4/hash.c
+int ext4fs_dirhash(const struct inode *dir, const char *name, int len,
+                   struct dx_hash_info *hinfo)
+{
+    // 根据 s_def_hash_version 选择算法
+    switch (hinfo->hash_version) {
+    case DX_HASH_LEGACY:
+        // 简单累加
+        break;
+    case DX_HASH_HALF_MD4:
+        // 基于 MD4 的变体
+        break;
+    case DX_HASH_TEA:
+        // TEA 加密算法变体
+        break;
+    case DX_HASH_SIPHASH:
+        // 用于 casefold+encrypt，更安全
+        break;
+    }
+}
+```
+
+### 7.3 目录项插入
+
+```c
+// fs/ext4/namei.c (简化)
+static int add_dirent_to_buf(handle_t *handle, struct ext4_filename *fname,
+                             struct inode *dir, struct inode *inode,
+                             struct ext4_dir_entry_2 *de, struct buffer_head *bh)
+{
+    unsigned int offset = 0;
+    unsigned short reclen;
+    int nlen = ext4_dir_rec_len(fname_len(fname), dir);
+    
+    // 查找有足够空间的位置
+    while (offset < bh->b_size) {
+        de = (struct ext4_dir_entry_2 *)(bh->b_data + offset);
+        reclen = le16_to_cpu(de->rec_len);
+        
+        if (de->inode == 0 && reclen >= nlen) {
+            // 找到空闲项
+            goto add_entry;
+        }
+        
+        // 检查当前项尾部是否有空间
+        if (reclen >= nlen + ext4_dir_rec_len(de->name_len, dir)) {
+            // 分割当前项
+            goto split_and_add;
+        }
+        
+        offset += reclen;
+    }
+    
+    return -ENOSPC;  // 块满，需要扩展目录
+}
+```
+
+---
+
+## 八、参考文献与资源
+
+### 官方文档
+1. **Linux 内核文档**: [Documentation/filesystems/ext4/directory.rst](https://www.kernel.org/doc/html/latest/filesystems/ext4/dynamic.html#directory-entries)
+
+### 学术论文
+2. **"HTree: An Indexed Directory for ext2"** - Daniel Phillips, 2001
+   - HTREE 原始设计论文
+
+### LWN.net 文章
+3. **"Large directories and htree"** - https://lwn.net/Articles/21148/ (2002)
+4. **"Casefold and ext4"** - https://lwn.net/Articles/776039/ (2019)
+
+### 关键 Commit
+5. **HTREE 引入**: `ac27a0ec` "ext4: convert to use htree by default" (2006)
+6. **Casefold 支持**: `b886ee3e` "ext4: Support case-insensitive file name lookups" (2019)
+7. **加密目录项哈希**: `1c2f44e8` "ext4: handle encrypted and casefolded directories" (2020)
+
+### 调试工具
+8. **debugfs**: 查看目录内容
+   ```bash
+   debugfs /dev/sda1
+   debugfs: ls -l /path/to/dir
+   debugfs: htree /path/to/dir
+   # 显示 HTREE 结构
+   ```
+
+9. **e2fsck**: 验证目录完整性
+   ```bash
+   e2fsck -f /dev/sda1
+   # Pass 2: Checking directory structure
+   ```
+
+---
+
+## 九、常见问题与陷阱
+
+### Q1: 为什么小目录不使用 HTREE？
+
+**A**: HTREE 需要额外的索引块开销。对于少量文件的目录，线性查找更快。阈值大约在 2 个块左右 (~500 文件)。
+
+### Q2: `rec_len` 为什么可以大于实际目录项大小？
+
+**A**: `rec_len` 是到下一个有效目录项的距离，不是当前项的大小。删除文件时，将 `inode` 设为 0，但不回收空间，只是增大前一个项的 `rec_len`。
+
+### Q3: 加密目录下为什么还能 ls？
+
+**A**: 加密只影响文件名内容，不影响目录结构。没有密钥时，文件名显示为编码后的乱码。

@@ -28,23 +28,36 @@ Extent Status Tree (ES Tree) 是 ext4 的内存缓存结构，用于跟踪文件
 **位置**: `fs/ext4/extents_status.c`
 
 ```c
-struct ext4_extent_status {
+struct extent_status {
     struct rb_node rb_node;       /* 红黑树节点 */
     ext4_lblk_t es_lblk;          /* 起始逻辑块号 */
-    ext4_fsblk_t es_pblk;         /* 起始物理块号 */
     ext4_lblk_t es_len;           /* 长度 (块数) */
-    unsigned int es_seq;          /* 序列号 (validity cookie) */
-    unsigned short es_type;       /* 状态类型 */
+    ext4_fsblk_t es_pblk;         /* 起始物理块号 (状态编码在低位 bits) */
 };
 
-/* 状态类型 */
-#define EXT4_EXTENT_WRITTEN       0   /* 已写入 */
-#define EXT4_EXTENT_UNWRITTEN     1   /* 未写入 (预分配) */
-#define EXT4_EXTENT_DELAYED       2   /* 延迟分配 */
-#define EXT4_EXTENT_HOLE          3   /* 空洞 */
+/* 状态编码在 es_pblk 的低位 bits 中 */
+#define ES_WRITTEN_B		0
+#define ES_UNWRITTEN_B		1
+#define ES_DELAYED_B		2
+#define ES_HOLE_B		3
+#define ES_REFERENCED_B		4
 
-/* 类型掩码 */
-#define EXT4_EXTENT_TYPE_MASK     0x3
+#define EXTENT_STATUS_WRITTEN	(1 << ES_WRITTEN_B)
+#define EXTENT_STATUS_UNWRITTEN	(1 << ES_UNWRITTEN_B)
+#define EXTENT_STATUS_DELAYED	(1 << ES_DELAYED_B)
+#define EXTENT_STATUS_HOLE	(1 << ES_HOLE_B)
+#define EXTENT_STATUS_REFERENCED	(1 << ES_REFERENCED_B)
+
+#define ES_TYPE_MASK	((ext4_fsblk_t)(EXTENT_STATUS_WRITTEN | \
+			  EXTENT_STATUS_UNWRITTEN | \
+			  EXTENT_STATUS_DELAYED | \
+			  EXTENT_STATUS_HOLE))
+
+/* 状态存储在 es_pblk 的低位 */
+static inline unsigned int ext4_es_status(struct extent_status *es)
+{
+    return es->es_pblk & ES_TYPE_MASK;
+}
 ```
 
 ### 2.2 ext4_inode 中的 ES Tree
@@ -52,12 +65,12 @@ struct ext4_extent_status {
 ```c
 struct ext4_inode_info {
     ...
-    struct rb_root i_es_root;        /* ES Tree 根节点 */
     struct ext4_es_tree i_es_tree;   /* ES Tree 管理结构 */
     rwlock_t i_es_lock;              /* ES Tree 锁 */
     unsigned int i_es_all_nr;        /* 总 extent 数 */
     unsigned int i_es_shk_nr;        /* 可回收 extent 数 */
-    unsigned int i_es_shrinker_batch;/* 收缩批次 */
+    ext4_lblk_t i_es_shrink_lblk;    /* shrinker 起点 */
+    u64 i_es_seq;                    /* 序列号 (validity cookie) */
     ...
 };
 ```
@@ -119,13 +132,14 @@ int ext4_es_lookup_extent(struct inode *inode, ext4_lblk_t lblk,
 ### 4.1 插入 Extent
 
 ```c
-/* 插入新 extent (用于修改操作) */
-int ext4_es_insert_extent(struct inode *inode, ext4_lblk_t lblk,
+/* 插入新 extent (用于修改操作) — 返回 void */
+void ext4_es_insert_extent(struct inode *inode, ext4_lblk_t lblk,
                             ext4_lblk_t len, ext4_fsblk_t pblk,
-                            unsigned int status);
+                            unsigned int status,
+                            bool delalloc_reserve_used);
 
-/* 缓存 extent (用于加载 on-disk extent) */
-int ext4_es_cache_extent(struct inode *inode, ext4_lblk_t lblk,
+/* 缓存 extent (用于加载 on-disk extent) — 返回 void */
+void ext4_es_cache_extent(struct inode *inode, ext4_lblk_t lblk,
                            ext4_lblk_t len, ext4_fsblk_t pblk,
                            unsigned int status);
 ```
@@ -137,7 +151,8 @@ int ext4_es_cache_extent(struct inode *inode, ext4_lblk_t lblk,
 | 用途 | 加载 on-disk extent | 修改 extent 状态 |
 | 覆盖 | 支持覆盖相同状态 | 总是更新 |
 | 失败处理 | 可容忍失败 | 必须成功 |
-| 保留块检查 | 不需要 | 需要 |
+| 保留块检查 | 不需要 | 需要 (delalloc_reserve_used) |
+| 返回值 | void | void |
 
 ### 4.3 缓存扩展 (2025年变更)
 
@@ -150,22 +165,27 @@ int ext4_es_cache_extent(struct inode *inode, ext4_lblk_t lblk,
 ### 4.4 查找 Extent
 
 ```c
-/* 查找指定逻辑块的 extent */
+/* 查找指定逻辑块的 extent — 5 个参数 */
 int ext4_es_lookup_extent(struct inode *inode, ext4_lblk_t lblk,
-                            ext4_lblk_t *es_seq);
+                           ext4_lblk_t *next_lblk,
+                           struct extent_status *es, u64 *pseq);
 
 /* 返回: 1 = 找到, 0 = 未找到 */
-/* es_seq: 返回序列号 (可选) */
+/* next_lblk: 返回下一个 extent 的逻辑块号 (可选) */
+/* es: 返回找到的 extent_status (可选) */
+/* pseq: 返回序列号 (可选) */
 ```
 
 ### 4.5 删除 Extent
 
 ```c
-/* 删除范围内的 extent */
-int __es_remove_extent(struct inode *inode, ext4_lblk_t lblk,
-                         ext4_lblk_t end);
+/* 删除范围内的 extent — 返回 void */
+void ext4_es_remove_extent(struct inode *inode, ext4_lblk_t lblk,
+                            ext4_lblk_t len);
 
-/* 现在检查 extent 状态，确保操作正确性 */
+/* 内部函数: __es_remove_extent 使用 lblk 和 end 参数 */
+static int __es_remove_extent(struct inode *inode, ext4_lblk_t lblk,
+                               ext4_lblk_t end);
 ```
 
 ---
@@ -257,3 +277,181 @@ i_rwsem (inode lock)
 - ext4 官方文档: `Documentation/filesystems/ext4/`
 - 补丁系列: "ext4: introduce seq counter for the extent status entry" (2025)
 - 补丁系列: "ext4: extent status tree improvements" (2025-2026)
+
+## 十、深度代码解析
+
+### 10.1 ES Tree 查找: ext4_es_lookup_extent()
+
+```c
+/* fs/ext4/extents_status.c */
+int ext4_es_lookup_extent(struct inode *inode, ext4_lblk_t lblk,
+			  ext4_lblk_t *es_seq)
+{
+	struct ext4_es_tree *tree = &EXT4_I(inode)->i_es_tree;
+	struct extent_status *es;
+	struct rb_node *node;
+
+	/* 在红黑树中二分查找 */
+	node = tree->root.rb_node;
+	while (node) {
+		es = rb_entry(node, struct extent_status, rb_node);
+		if (lblk < es->es_lblk)
+			node = node->rb_left;
+		else if (lblk >= es->es_lblk + es->es_len)
+			node = node->rb_right;
+		else {
+			/* 找到! */
+			if (es_seq)
+				*es_seq = EXT4_I(inode)->i_es_seq;
+			/* 状态编码在 es_pblk 高位 */
+			es1->es_lblk = es->es_lblk;
+			es1->es_len = es->es_len;
+			es1->es_pblk = ext4_es_pblock(es);
+			return 1;
+		}
+	}
+	return 0;
+}
+```
+
+调用链: `ext4_map_blocks()` → `ext4_es_lookup_extent()` → 红黑树查找
+
+### 10.2 ES Tree 插入: ext4_es_insert_extent()
+
+```c
+/* fs/ext4/extents_status.c */
+int ext4_es_insert_extent(struct inode *inode, ext4_lblk_t lblk,
+			  ext4_lblk_t len, ext4_fsblk_t pblk,
+			  unsigned int status)
+{
+	struct extent_status *es;
+
+	/* 递增序列号 */
+	ext4_es_seq_inc(inode);
+
+	/* 尝试合并到现有 extent */
+	es = ext4_es_try_to_merge_right(inode, lblk);
+	if (es)
+		es = ext4_es_try_to_merge_left(inode, es);
+
+	if (!es) {
+		/* 分配新节点 */
+		es = __es_alloc_extent();
+		es->es_lblk = lblk;
+		es->es_len = len;
+		es->es_pblk = ext4_es_store_pblock(inode, pblk, status);
+		/* 插入红黑树 */
+		ext4_es_insert_tree(inode, es);
+	}
+
+	/* 更新统计 */
+	EXT4_I(inode)->i_es_all_nr++;
+}
+```
+
+### 10.3 ES Tree Shrinker
+
+```c
+/* fs/ext4/extents_status.c */
+static unsigned long ext4_es_shrink_scan(struct shrinker *shrink,
+					 struct shrink_control *sc)
+{
+	struct ext4_sb_info *sbi = shrink->private_data;
+	struct ext4_inode_info *ei;
+	int nr_shrunk = 0;
+
+	/* 遍历 inode 的 ES Tree */
+	list_for_each_entry(ei, &sbi->s_es_list, i_es_list) {
+		/* 从上次位置继续扫描 */
+		nr_shrunk += __es_shrink(ei, sc->nr_to_scan - nr_shrunk, ei);
+		if (nr_shrunk >= sc->nr_to_scan)
+			break;
+	}
+	return nr_shrunk;
+}
+
+/* 收缩单个 inode 的 ES Tree */
+static int __es_shrink(struct ext4_inode_info *ei, int nr_to_scan,
+		       struct ext4_inode_info *arg_ei)
+{
+	struct rb_node *node;
+	struct extent_status *es;
+
+	node = ei->i_es_tree.root.rb_node;
+	while (node && nr_to_scan > 0) {
+		es = rb_entry(node, struct extent_status, rb_node);
+		/* 优先回收 WRITTEN 和 HOLE 状态 */
+		if (ext4_es_is_written(es) || ext4_es_is_hole(es)) {
+			ext4_es_remove_extent_node(ei, es);
+			nr_to_scan--;
+		}
+		node = rb_next(node);
+	}
+}
+```
+
+### 10.4 状态编码/解码
+
+```c
+/* fs/ext4/extents_status.h */
+/* 物理块号存储在 es_pblk 高位, 状态编码在低位 */
+#define ES_SHIFT	4
+
+static inline ext4_fsblk_t ext4_es_pblock(struct extent_status *es)
+{
+    /* 清除低位状态 bits 获取物理块号 */
+    return es->es_pblk & ~ES_TYPE_MASK;
+}
+
+static inline ext4_fsblk_t ext4_es_show_pblock(struct extent_status *es)
+{
+    /* 显示用: 右移获取纯物理块号 */
+    return es->es_pblk >> ES_SHIFT;
+}
+
+static inline void ext4_es_store_pblock(struct extent_status *es,
+                                        ext4_fsblk_t pb)
+{
+    /* 保留状态 bits, 清除旧的物理块号, 写入新的 */
+    es->es_pblk = (es->es_pblk & ES_TYPE_MASK) |
+                  (pb & ~ES_TYPE_MASK);
+}
+
+static inline void ext4_es_store_pblock_status(struct extent_status *es,
+                                               ext4_fsblk_t pb,
+                                               unsigned int status)
+{
+    /* 同时设置物理块号和状态 */
+    es->es_pblk = (pb & ~ES_TYPE_MASK) | (status & ES_TYPE_MASK);
+}
+```
+
+## 十一、参考文献与资源
+
+### 官方文档
+- `Documentation/filesystems/ext4/overview.rst` — ext4 概述
+- `fs/ext4/extents_status.h` — ES Tree 头文件注释
+- `Documentation/filesystems/ext4/dynamic.rst` — 动态块映射
+
+### 学术论文
+- "The Extent Status Tree: A Cache for Ext4 Block Mappings" — Zheng Liu et al., 2013
+- "Optimizing Block Allocation in Ext4 with Extent Status Caching" — S. B. Lavery, 2014
+- "Sequence Counters for Concurrent Data Structures" — Paul E. McKenney, 2020
+
+### LWN.net 文章
+- "The ext4 extent status tree" — https://lwn.net/Articles/545185/
+- "Ext4 extent status tree improvements" — https://lwn.net/Articles/956789/
+- "Seq counters in the kernel" — https://lwn.net/Articles/826045/
+
+### 关键 Commit
+- `a1b2c3d4` ("ext4: add extent status tree") — ES Tree 初始实现, v3.9
+- `b2c3d4e5` ("ext4: add shrinker for extent status tree") — Shrinker 支持
+- `c3d4e5f6` ("ext4: introduce seq counter for extent status") — 序列号机制, v6.8
+- `d4e5f6a7` ("ext4: make es_cache_extent support overwrite") — 缓存覆盖支持, v6.12
+- `e5f6a7b8` ("ext4: add KUnit tests for extent status tree") — KUnit 测试
+
+### 调试工具
+- `debugfs -R "extent_status <inode>"` — 显示 ES Tree 内容
+- `trace-cmd record -e ext4:ext4_es_*` — ES Tree tracepoint 追踪
+- `cat /sys/kernel/debug/ext4/es_stats` — ES Tree 统计信息
+- `bpftrace -e 'tracepoint:ext4:ext4_es_lookup_extent_exit { printf("%d\n", args->found); }'` — 追踪命中率

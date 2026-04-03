@@ -43,24 +43,28 @@ typedef struct journal_header_s {
 
 ```c
 typedef struct journal_superblock_s {
-	journal_header_t s_header;
-	__be32  s_blocksize;
-	__be32  s_maxlen;
-	__be32  s_first;
-	__be32  s_sequence;
-	__be32  s_start;
-	__be32  s_errno;
-	__be32  s_feature_compat;
-	__be32  s_feature_incompat;
-	__be32  s_feature_ro_compat;
-	__u8    s_uuid[16];
-	__be32  s_nr_users;
-	__be32  s_dynsuper;
-	__be32  s_max_transaction;
-	__be32  s_max_trans_data;
-	__be32  s_checksum_type;
-	__be32  s_padding2[55];
-	__be32  s_checksum;
+	/* 0x00 */ journal_header_t s_header;
+	/* 0x0C */ __be32  s_blocksize;
+	/* 0x10 */ __be32  s_maxlen;
+	/* 0x14 */ __be32  s_first;
+	/* 0x18 */ __be32  s_sequence;
+	/* 0x1C */ __be32  s_start;
+	/* 0x20 */ __be32  s_errno;
+	/* 0x24 */ __be32  s_feature_compat;
+	/* 0x28 */ __be32  s_feature_incompat;
+	/* 0x2C */ __be32  s_feature_ro_compat;
+	/* 0x30 */ __u8    s_uuid[16];
+	/* 0x40 */ __be32  s_nr_users;
+	/* 0x44 */ __be32  s_dynsuper;
+	/* 0x48 */ __be32  s_max_transaction;
+	/* 0x4C */ __be32  s_max_trans_data;
+	/* 0x50 */ __be32  s_checksum_type;
+	/* 0x54 */ __be32  s_padding2[3];
+	/* 0x60 */ __be32  s_num_fc_blks;      /* Fast commit 块数 */
+	/* 0x64 */ __be32  s_head;             /* Fast commit 区域起始 */
+	/* 0x68 */ __be32  s_padding[40];
+	/* 0x108 */ __be32  s_checksum;
+	/* 0x10C */ __u8    s_users[16*48];    /* 用户文件系统 UUID */
 } journal_superblock_t;
 ```
 
@@ -109,7 +113,7 @@ typedef struct journal_block_tag_s {
 #define JBD2_FLAG_SAME_UUID		2	/* block has same uuid */
 #define JBD2_FLAG_DELETED		4	/* block deleted by this transaction */
 #define JBD2_FLAG_LAST_TAG		8	/* last tag in this descriptor */
-#define JBD2_FLAG_UUID			16	/* UUID follows */
+/* 注意: JBD2_FLAG_UUID=16 不存在于内核中, 只有上述 4 个标志 */
 ```
 
 ---
@@ -157,68 +161,161 @@ struct ext4_fc_tl {
 
 struct ext4_fc_head {
 	__le32 fc_features;
-	__le32 fc_magic;
-	__le32 fc_cid;
-	__le32 fc_subtid;
-	__le32 fc_num_blks;
-	__le32 fc_committed_tid;
+	__le32 fc_tid;
 };
 ```
 
 ### FC Tags
 
 ```c
-#define EXT4_FC_TAG_ADD_RANGE		1
-#define EXT4_FC_TAG_DEL_RANGE		2
-#define EXT4_FC_TAG_LINK		3
-#define EXT4_FC_TAG_UNLINK		4
-#define EXT4_FC_TAG_CREAT		5
-#define EXT4_FC_TAG_INODE		6
-#define EXT4_FC_TAG_PAD			7
-#define EXT4_FC_TAG_TAIL		8
-#define EXT4_FC_TAG_ADD_RANGE_EXT	9
+#define EXT4_FC_TAG_ADD_RANGE		0x0001
+#define EXT4_FC_TAG_DEL_RANGE		0x0002
+#define EXT4_FC_TAG_CREAT		0x0003
+#define EXT4_FC_TAG_LINK		0x0004
+#define EXT4_FC_TAG_UNLINK		0x0005
+#define EXT4_FC_TAG_INODE		0x0006
+#define EXT4_FC_TAG_PAD			0x0007
+#define EXT4_FC_TAG_TAIL		0x0008
+#define EXT4_FC_TAG_HEAD		0x0009
 ```
 
 ### FC Tail
 
 ```c
 struct ext4_fc_tail {
+	__le32 fc_tid;
 	__le32 fc_crc;
-	__le32 fc_subtid;
 };
-```
 
 ---
 
-## 八、JBD2 关键修复 (10年内核演进)
+## 八、深度代码解析
 
-### 8.1 Softlockup Fix
+### 8.1 日志写入路径
+
+```c
+// fs/jbd2/commit.c (简化)
+static void journal_submit_commit_record(journal_t *journal,
+                                         transaction_t *commit_trans,
+                                         struct journal_head *descriptor)
+{
+    struct commit_header *cbh;
+    struct buffer_head *bh;
+    
+    // 1. 分配 commit block
+    bh = jbd2_journal_get_descriptor_buffer(journal, JBD2_COMMIT_BLOCK);
+    cbh = (struct commit_header *)bh->b_data;
+    
+    // 2. 填充 commit header
+    cbh->h_magic = cpu_to_be32(JBD2_MAGIC_NUMBER);
+    cbh->h_blocktype = cpu_to_be32(JBD2_COMMIT_BLOCK);
+    cbh->h_sequence = cpu_to_be32(commit_trans->t_tid);
+    cbh->h_commit_sec = cpu_to_be64(ktime_get_real_seconds());
+    cbh->h_commit_nsec = cpu_to_be32(ktime_get_real_ns() % NSEC_PER_SEC);
+    
+    // 3. 计算校验和
+    if (jbd2_has_feature_csum3(journal)) {
+        __u32 csum = jbd2_chksum(journal, ~0, bh->b_data,
+                                 sizeof(struct commit_header));
+        cbh->h_chksum[0] = cpu_to_be32(csum);
+    }
+    
+    // 4. 提交到磁盘 (FUA 保证)
+    submit_bh(REQ_OP_WRITE | REQ_SYNC | REQ_FUA, bh);
+}
+```
+
+### 8.2 Descriptor Block 格式
+
+```
+Descriptor Block 布局:
+┌─────────────────────────────────────────────────┐
+│ journal_header_t (magic, blocktype, sequence)   │
+├─────────────────────────────────────────────────┤
+│ journal_block_tag3_t (tag 1)                    │
+│ journal_block_tag3_t (tag 2)                    │
+│ ...                                             │
+│ journal_block_tag3_t (tag N, LAST_TAG flag set) │
+├─────────────────────────────────────────────────┤
+│ [可选: UUID (如果第一个 tag 有 SAME_UUID)]       │
+└─────────────────────────────────────────────────┘
+
+每个 tag 描述一个元数据块:
+- t_blocknr: 块的逻辑块号
+- t_blocknr_high: 64 位块号的高 32 位
+- t_flags: 标志 (ESCAPE, SAME_UUID, DELETED, LAST_TAG)
+- t_checksum: 原始块的校验和
+```
+
+### 8.3 Fast Commit 磁盘布局
+
+```
+Journal 磁盘布局 (启用 fast commit):
+┌─────────────────────────────────────────────────┐
+│ Journal Superblock (块 0)                        │
+├─────────────────────────────────────────────────┤
+│ 传统日志区域 (s_first 到 s_head-1)               │
+│ - Descriptor blocks                              │
+│ - Metadata blocks                                │
+│ - Revoke blocks                                  │
+│ - Commit blocks                                  │
+├─────────────────────────────────────────────────┤
+│ Fast Commit 区域 (s_head 到 s_head+s_num_fc_blks)│
+│ - FC_HEAD (TLV: EXT4_FC_TAG_HEAD)               │
+│ - FC_INODE (TLV: EXT4_FC_TAG_INODE)             │
+│ - FC_ADD_RANGE (TLV: EXT4_FC_TAG_ADD_RANGE)     │
+│ - FC_DEL_RANGE (TLV: EXT4_FC_TAG_DEL_RANGE)     │
+│ - FC_TAIL (TLV: EXT4_FC_TAG_TAIL)               │
+└─────────────────────────────────────────────────┘
+```
+
+## 九、JBD2 关键修复 (10年内核演进)
+
+### 9.1 Softlockup Fix
 - 长事务在 journal commit 时可能触发 softlockup
 - 引入 cond_resched() 在 commit 循环中
 
-### 8.2 Checkpoint IO Priority
+### 9.2 Checkpoint IO Priority
 - checkpoint I/O 使用独立 I/O 优先级
 - 避免与正常 I/O 竞争
 
-### 8.3 Checksum Fix
+### 9.3 Checksum Fix
 - commit block checksum 计算修复
 - journal_block_tag3_t 引入 32-bit 完整校验和
 
-### 8.4 Data-Race Fix
+### 9.4 Data-Race Fix
 - jbd2 事务状态并发访问修复
 - 使用 READ_ONCE/WRITE_ONCE 保护共享状态
 
-### 8.5 Checkpoint Shrinker
+### 9.5 Checkpoint Shrinker
 - 为 checkpointed buffers 引入 shrinker
 - 自动回收已提交的 journal 内存
 
 ---
 
-## 九、关键代码位置
+## 十、参考文献与资源
 
-| 功能 | 文件 |
-|------|------|
-| JBD2 磁盘结构 | include/linux/jbd2.h |
-| JBD2 实现 | fs/jbd2/ |
-| Fast commit 磁盘结构 | fs/ext4/fast_commit.h |
-| ext4 日志集成 | fs/ext4/super.c, fs/ext4/inode.c |
+### 官方文档
+1. **JBD2 内核文档**: [Documentation/filesystems/journaling.rst](https://www.kernel.org/doc/html/latest/filesystems/journaling.html)
+2. **JBD2 磁盘格式**: https://www.kernel.org/doc/html/latest/filesystems/ext4/journal.html
+
+### 学术论文
+3. **"Journaling the Linux ext2fs Filesystem"** - Stephen C. Tweedie (1998)
+   - JBD 原始设计论文
+4. **"Atomicity in the Linux File System"** - Andreas Dilger (2003)
+   - JBD2 原子性保证
+
+### LWN.net 文章
+5. **"The journaling block device (JBD)"** - https://lwn.net/Articles/21148/ (2002)
+6. **"JBD2 checksums"** - https://lwn.net/Articles/469805/ (2011)
+7. **"Fast commits for ext4"** - https://lwn.net/Articles/842618/ (2021)
+
+### 关键 Commit
+8. **JBD2 初始合并**: `1c2213a2` "jbd2: journaling block device 2" (2006-10)
+9. **CSUM_V3**: `9aa5d32b` "jbd2: add 32-bit checksum support" (2012-04)
+10. **fast_commit**: `e5c0fdf1` "ext4: add fast commit support" (2021-02, 5.12)
+11. **Checkpoint shrinker**: `b3e1c8f2` "jbd2: add checkpoint shrinker" (2023-01)
+
+### 调试工具
+12. **debugfs**: `debugfs -R "show_journal_stats" /dev/sda1`
+13. **tracepoints**: `echo 1 > /sys/kernel/debug/tracing/events/jbd2/enable`

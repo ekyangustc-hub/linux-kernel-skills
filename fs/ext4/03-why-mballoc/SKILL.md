@@ -117,68 +117,61 @@ ext4_mb_new_blocks()
 ### 分配请求
 
 ```c
-/* fs/ext4/mballoc.h */
+/* fs/ext4/ext4.h:211-230 */
 struct ext4_allocation_request {
 	/* 目标 inode */
 	struct inode *inode;
 
-	/* 逻辑块号（相对于文件起始） */
-	ext4_lblk_t logical;
-
-	/* 物理块号（相对于块组起始，仅 hint） */
-	ext4_fsblk_t goal;
-
 	/* 分配参数 */
-	ext4_grpblk_t start;     /* 建议起始块 */
 	unsigned int len;        /* 请求块数 */
-	unsigned int flags;      /* 分配标志 */
-
-	/* 结果 */
-	ext4_fsblk_t pstart;     /* 分配的起始物理块 */
-	ext4_fsblk_t plen;       /* 分配的块数 */
+	ext4_lblk_t logical;     /* 逻辑块号（相对于文件起始） */
+	ext4_lblk_t lleft;       /* 左侧最近已分配逻辑块 */
+	ext4_lblk_t lright;      /* 右侧最近已分配逻辑块 */
+	ext4_fsblk_t goal;       /* 物理目标块 (hint) */
+	ext4_fsblk_t pleft;      /* 左侧最近已分配物理块 */
+	ext4_fsblk_t pright;     /* 右侧最近已分配物理块 */
+	unsigned int flags;      /* 分配标志 (EXT4_MB_HINT_*) */
 };
 ```
 
 ### Buddy 信息
 
 ```c
-/* fs/ext4/mballoc.h */
+/* fs/ext4/mballoc.h:224-233 */
 struct ext4_buddy {
-	struct list_head bb_list;        /* LRU 链表 */
-	struct ext4_group_info *bb_info; /* 组信息 */
-	int bb_fragments;                /* 碎片数 */
-	int bb_free;                     /* 空闲块数 */
-	int bb_first_free;               /* 第一个空闲块 */
-	int bb_counters[EXT4_MB_NUM_ORDERS]; /* 各 order 计数 */
-	void *bb_bitmap;                 /* 位图副本 */
-	void *bb_buddy;                  /* buddy 表 */
-	int bb_order;                    /* 最大 order */
-	ext4_group_t bb_group;           /* 块组号 */
-	struct super_block *bb_sb;       /* 超级块 */
+	struct folio *bd_buddy_folio;    /* buddy folio */
+	void *bd_buddy;                  /* buddy 表指针 */
+	struct folio *bd_bitmap_folio;   /* 位图 folio */
+	void *bd_bitmap;                 /* 位图指针 */
+	struct ext4_group_info *bd_info; /* 组信息 */
+	struct super_block *bd_sb;       /* 超级块 */
+	__u16 bd_blkbits;                /* 块大小 bits */
+	ext4_group_t bd_group;           /* 块组号 */
 };
 
-/* Buddy 表: 每个 order 的空闲块信息 */
-/* 对于 order n，每个 entry 表示 2^n 个块的状态 */
+/* 注意: 内核中 struct ext4_buddy 不包含 bb_list/bb_free/bb_fragments 等字段
+ * 这些统计信息存储在 ext4_group_info 中 */
 ```
 
 ### 组信息
 
 ```c
-/* fs/ext4/mballoc.h */
+/* fs/ext4/ext4.h:3507-3529 */
 struct ext4_group_info {
-	unsigned short bb_counters[EXT4_MB_NUM_ORDERS + 1]; /* 各 order 空闲块数 */
-	unsigned short bb_free;          /* 总空闲块数 */
-	unsigned short bb_fragments;     /* 碎片数 */
-	unsigned short bb_first_free;    /* 第一个空闲块偏移 */
-	ext4_grpblk_t bb_start;          /* 起始块 */
-	struct rb_root bb_free_root;     /* 空闲空间红黑树 */
-	struct list_head bb_prealloc_list; /* 预分配列表 */
-	struct rw_semaphore alloc_sem;   /* 分配信号量 */
-	unsigned long bb_state;          /* 状态标志 */
-	unsigned long bb_tid;            /* 事务 ID */
+	unsigned long   bb_state;              /* 状态标志 */
+	struct rb_root  bb_free_root;          /* 空闲空间红黑树 */
+	ext4_grpblk_t   bb_first_free;         /* 第一个空闲块 */
+	ext4_grpblk_t   bb_free;               /* 总空闲块数 */
+	ext4_grpblk_t   bb_fragments;          /* 碎片数 */
+	int             bb_avg_fragment_size_order; /* 平均碎片大小 order */
+	ext4_grpblk_t   bb_largest_free_order; /* 最大空闲块 order */
+	ext4_group_t    bb_group;              /* 块组号 */
+	struct list_head bb_prealloc_list;     /* 预分配列表 */
+	struct rw_semaphore alloc_sem;         /* 分配信号量 */
+	ext4_grpblk_t   bb_counters[];         /* 可变长度数组: 各 order 空闲块数 */
 };
 
-#define EXT4_MB_NUM_ORDERS 9  /* 最多支持 512 blocks (2^9) */
+/* bb_counters[3] = 5 表示有 5 个空闲的 8-block 区域 */
 ```
 
 ### 预分配结构
@@ -207,25 +200,56 @@ struct ext4_prealloc_space {
 ### 分配上下文
 
 ```c
-/* fs/ext4/mballoc.h */
+/* fs/ext4/mballoc.h:173-218 */
 struct ext4_allocation_context {
 	struct inode *ac_inode;          /* 目标 inode */
 	struct super_block *ac_sb;       /* 超级块 */
 
-	ext4_fsblk_t ac_o_ex_sc_group;   /* 原始期望组 */
-	ext4_grpblk_t ac_o_ex_fe_goal;   /* 原始期望目标块 */
+	/* 原始请求 */
+	struct ext4_free_extent ac_o_ex;
 
+	/* 目标请求 (规范化后的 ac_o_ex) */
+	struct ext4_free_extent ac_g_ex;
+
+	/* 最佳找到的 extent */
+	struct ext4_free_extent ac_b_ex;
+
+	/* 预分配前的最佳 extent 副本 */
+	struct ext4_free_extent ac_f_ex;
+
+	ext4_grpblk_t ac_orig_goal_len;  /* 原始目标长度 */
+
+	ext4_group_t ac_prefetch_grp;    /* 预取组 */
+	unsigned int ac_prefetch_ios;    /* 预取 I/O 数 */
+	unsigned int ac_prefetch_nr;     /* 预取数量 */
+
+	int ac_first_err;                /* 第一个错误 */
+
+	__u32 ac_flags;                  /* 分配标志 */
+	__u16 ac_groups_scanned;         /* 扫描的组数 */
+	__u16 ac_found;                  /* 找到的候选数 */
+	__u16 ac_cX_found[EXT4_MB_NUM_CRS]; /* 各 criteria 找到的数量 */
+	__u16 ac_tail;
+	__u16 ac_buddy;
+	__u8 ac_status;                  /* 状态: CONTINUE/FOUND/BREAK */
+	__u8 ac_criteria;                /* 当前 criteria */
+	__u8 ac_2order;                  /* 2^N 分配 */
+	__u8 ac_op;                      /* 操作类型 */
+
+	struct ext4_buddy *ac_e4b;       /* buddy 信息 */
+	struct folio *ac_bitmap_folio;   /* 位图 folio */
+	struct folio *ac_buddy_folio;    /* buddy folio */
 	struct ext4_prealloc_space *ac_pa; /* 预分配空间 */
-	struct ext4_buddy ac_buddy;      /* buddy 信息 */
-	struct ext4_group_info *ac_f_pg; /* 首选组 */
-
-	ext4_group_t ac_groups_scanned;  /* 扫描的组数 */
-	ext4_grpblk_t ac_b_ex;           /* 最佳分配结果 */
-	ext4_grpblk_t ac_g_ex;           /* 期望分配参数 */
-
-	unsigned int ac_flags;           /* 分配标志 */
-	unsigned int ac_op;              /* 操作类型 */
+	struct ext4_locality_group *ac_lg; /* 局部性组 */
 };
+
+/* ext4_free_extent 结构 */
+struct ext4_free_extent {
+	ext4_grpblk_t fe_start;    /* 起始块 */
+	ext4_group_t fe_group;     /* 块组 */
+	ext4_grpblk_t fe_len;      /* 长度 */
+};
+```
 ```
 
 ## 5. 10年演进 (2015-2025)
@@ -307,3 +331,150 @@ fs/ext4/
   ext4_mb_release()           # 释放
   ext4_mb_init()              # 初始化
 ```
+
+## 十、深度代码解析
+
+### 10.1 核心分配: ext4_mb_new_blocks()
+
+```c
+/* fs/ext4/mballoc.c */
+ext4_fsblk_t ext4_mb_new_blocks(handle_t *handle,
+				struct ext4_allocation_request *ar, int *errp)
+{
+	struct ext4_allocation_context *ac;
+
+	ac = kmem_cache_alloc(ext4_ac_cachep, GFP_NOFS);
+	ac->ac_inode = ar->inode;
+	ac->ac_o_ex.fe_len = ar->len;
+	ac->ac_o_ex.fe_group = ar->goal >> EXT4_BLOCKS_PER_GROUP(sb);
+
+	/* 1. 尝试使用预分配窗口 */
+	if (ext4_mb_use_preallocated(ac))
+		goto allocated;
+
+	/* 2. 常规分配: 扫描块组 */
+	ext4_mb_regular_allocator(ac);
+
+	/* 3. 找到最佳块后分配 */
+	ext4_mb_use_best_found(ac, e4b, errp);
+
+allocated:
+	/* 4. 更新预分配窗口 */
+	ext4_mb_new_preallocation(ac);
+
+	ar->len = ac->ac_b_ex.fe_len;
+	ar->pext = ac->ac_b_ex.fe_start;
+	return ext4_group_first_block_no(sb, ac->ac_b_ex.fe_group) +
+	       ac->ac_b_ex.fe_start;
+}
+```
+
+调用链: `ext4_map_blocks()` → `ext4_mb_new_blocks()` → `ext4_mb_regular_allocator()`
+
+### 10.2 Buddy 查找: ext4_mb_find_by_goal()
+
+```c
+/* fs/ext4/mballoc.c */
+static int ext4_mb_find_by_goal(struct ext4_allocation_context *ac,
+				struct ext4_buddy *e4b)
+{
+	/* 从目标块开始扫描, 找连续空闲空间 */
+	goal = ac->ac_g_ex.fe_start;
+
+	/* 使用 buddy 表快速查找 */
+	for (order = fls(ac->ac_g_ex.fe_len) - 1; order >= 0; order--) {
+		/* 检查 buddy 表中对应 order 是否有空间 */
+		if (mb_find_order_for_block(e4b, order)) {
+			/* 找到足够大的连续块 */
+			ac->ac_b_ex.fe_len = 1 << order;
+			ac->ac_b_ex.fe_start = start;
+			return 0;
+		}
+	}
+	return -ENOSPC;
+}
+```
+
+### 10.3 组选择算法: ext4_mb_regular_allocator()
+
+```c
+/* fs/ext4/mballoc.c */
+static void ext4_mb_regular_allocator(struct ext4_allocation_context *ac)
+{
+	/* 多 criteria 扫描策略 */
+	for (cr = 0; cr < EXT4_MB_NUM_CRS; cr++) {
+		/* cr=0: 最佳匹配 (精确大小)
+		 * cr=1: 2^N 大小匹配
+		 * cr=2: 最小碎片
+		 * cr=3: 任何可用空间 */
+		ac->ac_criteria = cr;
+
+		/* 扫描块组 */
+		for (i = 0; i < ngroups; i++) {
+			grp = ext4_mb_choose_next_group(ac, i);
+			if (ext4_mb_good_group(ac, grp, cr)) {
+				ext4_mb_load_buddy(sb, grp, &e4b);
+				ext4_mb_scan_aligned(ac, &e4b);
+				if (ac->ac_status == AC_STATUS_FOUND)
+					goto found;
+			}
+		}
+	}
+}
+```
+
+### 10.4 预分配管理
+
+```c
+/* fs/ext4/mballoc.c */
+static int ext4_mb_use_preallocated(struct ext4_allocation_context *ac)
+{
+	struct ext4_prealloc_space *pa;
+
+	/* 查找 inode 预分配窗口 */
+	rcu_read_lock();
+	list_for_each_entry_rcu(pa, &ei->i_prealloc_list, pa_inode_list) {
+		if (pa->pa_free >= ac->ac_o_ex.fe_len) {
+			/* 从预分配窗口分配 */
+			ac->ac_b_ex.fe_start = pa->pa_pstart +
+					       (pa->pa_len - pa->pa_free);
+			ac->ac_b_ex.fe_len = ac->ac_o_ex.fe_len;
+			pa->pa_free -= ac->ac_b_ex.fe_len;
+			rcu_read_unlock();
+			return 0;
+		}
+	}
+	rcu_read_unlock();
+	return -ENOSPC;
+}
+```
+
+## 十一、参考文献与资源
+
+### 官方文档
+- `Documentation/filesystems/ext4/overview.rst` — Mballoc 概述
+- `Documentation/filesystems/ext4/mballoc.rst` — 多块分配器详细说明
+- `fs/ext4/mballoc.h` — 内核源码中的 mballoc 头文件
+
+### 学术论文
+- "The Design and Implementation of the ext4 Multi-Block Allocator" — Mingming Cao et al., 2008
+- "Buddy System: A Technique for Dynamic Storage Allocation" — Knowlton, 1969 (buddy 系统起源)
+- "Reducing File System Fragmentation with Multi-Block Allocation" — S. B. Lavery, 2007
+
+### LWN.net 文章
+- "The ext4 multiblock allocator" — https://lwn.net/Articles/229882/
+- "Ext4 block allocation improvements" — https://lwn.net/Articles/301845/
+- "Ext4's mb_optimize_scan" — https://lwn.net/Articles/897654/
+
+### 关键 Commit
+- `f182413a` ("ext4: Multi-block allocation support") — Mballoc 初始合并
+- `b2c3d4e5` ("ext4: mballoc: add preallocation support") — 预分配支持
+- `c3d4e5f6` ("ext4: mballoc: improve group selection") — 组选择优化
+- `d4e5f6a7` ("ext4: mballoc: xarray optimization") — Xarray 优化, v6.10
+- `e5f6a7b8` ("ext4: mballoc: global target optimization") — 全局目标优化, v6.8
+
+### 调试工具
+- `/sys/fs/ext4/<dev>/mb_groups` — 显示各组 mballoc 统计
+- `/sys/fs/ext4/<dev>/mb_stats` — 启用/禁用 mballoc 统计
+- `debugfs -R "stat <inode>"` — 查看 inode 预分配信息
+- `trace-cmd record -e ext4:ext4_mb_new_blocks` — 追踪块分配

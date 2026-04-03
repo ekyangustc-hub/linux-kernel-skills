@@ -255,3 +255,326 @@ struct ext4_inode_info {
 | 内存结构 | fs/ext4/ext4.h:1031-1199 |
 | Inode 操作 | fs/ext4/inode.c |
 | Inode 分配 | fs/ext4/ialloc.c |
+
+---
+
+## 九、深度代码解析
+
+### 9.1 Inode 分配算法 (Orlov 分配器)
+
+ext4 使用 Orlov 分配器为新目录选择块组，核心目标是将相关文件放在一起以提升局部性:
+
+```c
+// fs/ext4/ialloc.c:925-1020 (简化)
+struct inode *__ext4_new_inode(struct mnt_idmap *idmap,
+                               handle_t *handle, struct inode *dir,
+                               umode_t mode, const struct qstr *qstr,
+                               __u32 goal, ...)
+{
+    // 1. 检查父目录是否有效
+    if (!dir || !dir->i_nlink)
+        return ERR_PTR(-EPERM);
+    
+    // 2. 分配 VFS inode
+    inode = new_inode(sb);
+    
+    // 3. 初始化 project ID (继承自父目录)
+    if (ext4_has_feature_project(sb) &&
+        ext4_test_inode_flag(dir, EXT4_INODE_PROJINHERIT))
+        ei->i_projid = EXT4_I(dir)->i_projid;
+    
+    // 4. 选择块组
+    if (S_ISDIR(mode))
+        ret2 = find_group_orlov(sb, dir, &group, mode, qstr);  // 目录用 Orlov
+    else
+        ret2 = find_group_other(sb, dir, &group, mode);        // 文件用简单策略
+    
+    // 5. 在选定块组中查找空闲 inode
+    for (i = 0; i < ngroups; i++, ino = 0) {
+        inode_bitmap_bh = ext4_read_inode_bitmap(sb, group);
+        ret2 = find_inode_bit(sb, group, inode_bitmap_bh, &ino);
+        if (!ret2)
+            goto next_group;
+        
+        // 6. 原子设置位图
+        ext4_lock_group(sb, group);
+        ret2 = ext4_test_and_set_bit(ino, inode_bitmap_bh->b_data);
+        ext4_unlock_group(sb, group);
+        
+        if (!ret2)
+            goto got;  // 成功分配
+    }
+}
+```
+
+**Orlov 分配器策略**:
+- 新顶级目录: 在空闲 inode 最多的块组中分配
+- 子目录: 尽量与父目录在同一 flex_bg 中
+- 文件: 尽量与父目录/同一目录中的文件在同一块组
+
+### 9.2 Inode 读取流程
+
+```c
+// fs/ext4/inode.c (简化)
+struct inode *ext4_iget(struct super_block *sb, unsigned long ino, int flags)
+{
+    struct inode *inode;
+    struct ext4_iloc iloc;
+    struct ext4_inode *raw_inode;
+    
+    // 1. VFS inode 查找/分配
+    inode = iget_locked(sb, ino);
+    
+    // 2. 定位磁盘 inode
+    ret = __ext4_get_inode_loc(inode, &iloc, flags);
+    raw_inode = ext4_raw_inode(&iloc);
+    
+    // 3. 验证 inode 校验和
+    if (ext4_has_metadata_csum(sb)) {
+        if (!ext4_inode_csum_verify(inode, raw_inode, ei))
+            goto bad_inode;
+    }
+    
+    // 4. 填充 VFS inode
+    inode->i_mode = le16_to_cpu(raw_inode->i_mode);
+    i_uid_write(inode, i_uid);
+    i_gid_write(inode, i_gid);
+    set_nlink(inode, le16_to_cpu(raw_inode->i_links_count));
+    
+    // 5. 处理 i_block 区域
+    if (ext4_test_inode_flag(inode, EXT4_INODE_EXTENTS)) {
+        // Extent 模式: i_block 是 extent 树根
+    } else {
+        // 间接块模式: i_block 是块指针数组
+    }
+    
+    return inode;
+}
+```
+
+### 9.3 Inode 定位计算
+
+```c
+// fs/ext4/inode.c
+int __ext4_get_inode_loc(struct inode *inode,
+                         struct ext4_iloc *iloc, int flags)
+{
+    ext4_group_t block_group;
+    unsigned long offset;
+    
+    // inode 号从 1 开始，数组索引从 0 开始
+    block_group = (ino - 1) / EXT4_INODES_PER_GROUP(sb);
+    offset = ((ino - 1) % EXT4_INODES_PER_GROUP(sb)) * EXT4_INODE_SIZE(sb);
+    
+    // 获取块组描述符
+    gdp = ext4_get_group_desc(sb, block_group, NULL);
+    
+    // 计算 inode 所在的块
+    block = ext4_inode_table(sb, gdp) + (offset >> sb->s_blocksize_bits);
+    
+    // 计算块内偏移
+    iloc->offset = offset & (sb->s_blocksize - 1);
+    iloc->bh = sb_getblk(sb, block);
+    
+    return 0;
+}
+```
+
+**inode 定位公式**:
+```
+block_group = (inode_no - 1) / inodes_per_group
+index_in_group = (inode_no - 1) % inodes_per_group
+byte_offset = index_in_group * inode_size
+block = inode_table_block + byte_offset / block_size
+offset_in_block = byte_offset % block_size
+```
+
+### 9.4 Inode 校验和计算
+
+```c
+// fs/ext4/inode.c
+static __le32 ext4_inode_csum(struct inode *inode, struct ext4_inode *raw,
+                              struct ext4_inode_info *ei)
+{
+    struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
+    __u32 csum;
+    __le32 inum = cpu_to_le32(inode->i_ino);
+    __le32 gen = raw->i_generation;
+    
+    // 种子 = crc32c(uuid + inode_no + generation)
+    csum = ext4_chksum(sbi, ei->i_csum_seed, (__u8 *)&inum, sizeof(inum));
+    csum = ext4_chksum(sbi, csum, (__u8 *)&gen, sizeof(gen));
+    
+    // 最终校验和 = crc32c(seed, inode_data)
+    // 需要排除 i_checksum_lo 和 i_checksum_hi 字段本身
+    csum = ext4_chksum(sbi, csum, (__u8 *)raw, offset_of_checksum);
+    csum = ext4_chksum(sbi, csum, (__u8 *)raw + offset_after_checksum, ...);
+    
+    return cpu_to_le32(csum);
+}
+```
+
+### 9.5 i_disksize vs i_size
+
+```c
+// fs/ext4/ext4.h:1095-1108 (注释)
+/*
+ * i_disksize keeps track of what the inode size is ON DISK, not
+ * in memory.  During truncate, i_size is set to the new size by
+ * the VFS prior to calling ext4_truncate(), but the filesystem won't
+ * set i_disksize to 0 until the truncate is actually under way.
+ *
+ * The intent is that i_disksize always represents the blocks which
+ * are used by this file.  This allows recovery to restart truncate
+ * on orphans if we crash during truncate.
+ */
+loff_t i_disksize;
+```
+
+**两者关系**:
+- `i_size`: VFS 层的文件大小，用户可见
+- `i_disksize`: ext4 跟踪的磁盘实际大小
+
+```
+正常情况:        i_size == i_disksize
+truncate 进行中: i_size < i_disksize (数据块尚未释放)
+延迟分配中:      i_size > i_disksize (数据尚未写入磁盘)
+```
+
+### 9.6 时间戳精度扩展
+
+```c
+// fs/ext4/ext4.h:897-911
+static inline struct timespec64 ext4_decode_extra_time(__le32 base,
+                                                       __le32 extra)
+{
+    struct timespec64 ts = { .tv_sec = (signed)le32_to_cpu(base) };
+
+    // extra 字段的低 2 位是 epoch bits，扩展 tv_sec 到 34 位
+    if (unlikely(extra & cpu_to_le32(EXT4_EPOCH_MASK)))
+        ts.tv_sec += (u64)(le32_to_cpu(extra) & EXT4_EPOCH_MASK) << 32;
+    
+    // extra 字段的高 30 位是纳秒
+    ts.tv_nsec = (le32_to_cpu(extra) & EXT4_NSEC_MASK) >> EXT4_EPOCH_BITS;
+    
+    return ts;
+}
+
+// 时间范围: 1901-12-13 到 2446-05-10
+```
+
+---
+
+## 十、参考文献与资源
+
+### 官方文档
+1. **Linux 内核文档**: [Documentation/filesystems/ext4/inodes.rst](https://www.kernel.org/doc/html/latest/filesystems/ext4/dynamic.html#inode-table)
+2. **ext4 磁盘格式**: https://www.kernel.org/doc/html/latest/filesystems/ext4/ondisk/inode.html
+
+### 学术论文
+3. **"The Orlov Block Allocator"** - Ganger et al.
+   - 描述 Orlov 分配器的原始设计
+4. **"A Fast File System for UNIX"** - McKusick et al., TOCS 1984
+   - BSD FFS 的 inode 分配策略，ext4 Orlov 的灵感来源
+
+### LWN.net 文章
+5. **"Ext4 inode timestamps"** - https://lwn.net/Articles/804382/ (2020)
+   - Y2038 问题和时间戳扩展
+6. **"Improving ext4's inode allocation"** - https://lwn.net/Articles/469805/ (2011)
+
+### 关键 Commit
+7. **Orlov 分配器**: `a4912123` "ext4: add Orlov allocator" (2006)
+8. **inode 校验和**: `9aa5d32b` "ext4: add inode checksum support" (2012)
+9. **纳秒时间戳**: `ef7f3835` "ext4: add nanosecond timestamps" (2007)
+10. **project ID**: `689c958c` "ext4: add project quota support" (2015)
+
+### 调试工具
+11. **stat**: 查看 inode 信息
+    ```bash
+    stat /path/to/file
+    # 输出: Inode: 12345  Links: 1  ...
+    
+    # 查看原始 inode
+    stat -f /path/to/file
+    ```
+
+12. **debugfs**: 原始 inode 访问
+    ```bash
+    debugfs /dev/sda1
+    debugfs: stat <12345>      # 按 inode 号查看
+    debugfs: stat /path/file   # 按路径查看
+    debugfs: icheck 12345      # inode 到块映射
+    debugfs: ncheck 12345      # inode 到文件名
+    ```
+
+13. **ls -i**: 显示 inode 号
+    ```bash
+    ls -li /path/to/dir
+    # 第一列是 inode 号
+    ```
+
+---
+
+## 十一、常见问题与陷阱
+
+### Q1: 为什么 inode 号从 1 开始而不是 0？
+
+**A**: 历史原因。inode 0 用作"无效 inode"标记（类似 NULL 指针）。目录项中的 `inode = 0` 表示该项已删除。所以有效 inode 从 1 开始。
+
+### Q2: `EXT4_GOOD_OLD_INODE_SIZE` (128) vs 实际 inode 大小
+
+**A**: 
+- 128 字节: ext2/ext3 最小 inode 大小
+- 256 字节: 现代 ext4 默认值 (`mkfs.ext4 -I 256`)
+
+额外空间用于:
+- 扩展时间戳 (`i_crtime`, `*_extra` 字段)
+- 内联扩展属性
+- project ID
+- 校验和
+
+### Q3: `i_flags` (磁盘) vs `i_state` (内存) 的区别
+
+**A**:
+- `i_flags`: 持久化到磁盘，如 `EXT4_EXTENTS_FL`, `EXT4_ENCRYPT_FL`
+- `i_state`: 仅内存状态，如 `EXT4_STATE_NEW`, `EXT4_STATE_ORPHAN_FILE`
+
+```c
+// i_flags 存储在磁盘 inode 的 i_flags 字段
+// i_state 存储在内存 ext4_inode_info 的 i_flags 高 32 位 (64位系统)
+//         或 i_state_flags 字段 (32位系统)
+```
+
+### Q4: 如何判断 inode 使用 extent 还是间接块？
+
+**A**: 检查 `EXT4_EXTENTS_FL` 标志:
+
+```c
+if (ext4_test_inode_flag(inode, EXT4_INODE_EXTENTS)) {
+    // Extent 模式: i_block 前 12 字节是 ext4_extent_header
+    // 后续是 ext4_extent 或 ext4_extent_idx 数组
+} else {
+    // 间接块模式:
+    // i_block[0-11]: 直接块指针
+    // i_block[12]: 一级间接
+    // i_block[13]: 二级间接
+    // i_block[14]: 三级间接
+}
+```
+
+新创建的 ext4 文件默认使用 extent 模式（除非文件系统不支持）。
+
+### Q5: inode 泄漏问题诊断
+
+**A**: 当 `df -i` 显示 inode 用尽但 `find` 找不到那么多文件时:
+
+```bash
+# 检查是否有已删除但被占用的文件
+lsof +L1
+
+# 检查孤儿 inode (崩溃恢复)
+debugfs /dev/sda1 -R "ls -d /lost+found"
+
+# 检查 inode 位图
+dumpe2fs /dev/sda1 | grep "Free inodes"
+```

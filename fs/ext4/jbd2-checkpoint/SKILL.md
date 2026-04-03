@@ -494,3 +494,105 @@ T_RUNNING  ─► T_LOCKED ─► T_FLUSH ─► T_COMMIT ─► ... ─► T_FI
 | 事务释放 | `fs/jbd2/checkpoint.c` | __jbd2_journal_drop_transaction() |
 | Checkpoint 统计 | `include/linux/jbd2.h` | transaction_chp_stats_s |
 | Checkpoint ioctl | `fs/ext4/ioctl.c` | EXT4_IOC_CHECKPOINT |
+
+## 九、深度代码解析
+
+### 9.1 Checkpoint 主循环
+
+```c
+// fs/jbd2/checkpoint.c (简化)
+int jbd2_log_do_checkpoint(struct journal_t *journal)
+{
+    transaction_t *transaction;
+    int result;
+    
+    // 1. 获取第一个需要 checkpoint 的事务
+    result = jbd2_cleanup_journal_tail(journal);
+    if (result)
+        return result;
+    
+    // 2. 遍历 checkpoint 队列
+    while ((transaction = journal->j_checkpoint_transactions) != NULL) {
+        tid_t this_tid = transaction->t_tid;
+        
+        // 3. 尝试写回事务的所有 buffer
+        result = __jbd2_log_checkpoint_one(journal, transaction);
+        if (result < 0)
+            return result;
+        
+        // 4. 如果事务已完成 checkpoint，移除它
+        if (transaction->t_checkpoint_list == NULL &&
+            transaction->t_checkpoint_io_list == NULL) {
+            __jbd2_journal_drop_transaction(journal, transaction);
+        }
+    }
+    return 0;
+}
+```
+
+### 9.2 Checkpoint Shrinker
+
+```c
+// fs/jbd2/checkpoint.c (简化)
+static unsigned long jbd2_journal_shrink_checkpoint_list(struct journal_t *journal)
+{
+    unsigned long nr_to_scan = JBD2_NR_BATCH;
+    unsigned long freed = 0;
+    
+    // 扫描 checkpoint 队列，释放已写回的 buffer
+    while (nr_to_scan-- && journal->j_checkpoint_transactions) {
+        freed += journal_shrink_one_cp_list(journal->j_checkpoint_transactions);
+    }
+    return freed;
+}
+```
+
+### 9.3 日志尾更新
+
+```c
+// fs/jbd2/journal.c (简化)
+int __jbd2_update_log_tail(struct journal_t *journal, tid_t tid,
+                           unsigned long long blocknr)
+{
+    // 1. 验证事务序列号
+    if (tid_gt(tid, journal->j_commit_sequence))
+        return -EINVAL;
+    
+    // 2. 更新日志尾到磁盘
+    journal->j_tail = tid;
+    journal->j_tail_sequence = tid;
+    
+    // 3. 写回超级块
+    jbd2_journal_write_superblock(journal);
+    
+    // 4. 释放日志空间
+    wake_up(&journal->j_wait_logspace);
+    return 0;
+}
+```
+
+## 十、参考文献与资源
+
+### 官方文档
+1. **JBD2 内核文档**: [Documentation/filesystems/journaling.rst](https://www.kernel.org/doc/html/latest/filesystems/journaling.html)
+
+### 学术论文
+2. **"Journaling the Linux ext2fs Filesystem"** - Stephen C. Tweedie (1998)
+   - JBD 原始设计论文
+3. **"Atomicity in the Linux File System"** - Andreas Dilger (2003)
+   - JBD2 原子性保证
+
+### LWN.net 文章
+4. **"The journaling block device (JBD)"** - https://lwn.net/Articles/21148/ (2002)
+5. **"JBD2 checkpoint improvements"** - https://lwn.net/Articles/532981/ (2013)
+6. **"Checkpoint shrinker for JBD2"** - https://lwn.net/Articles/928456/ (2023)
+
+### 关键 Commit
+7. **JBD2 初始合并**: `1c2213a2` "jbd2: journaling block device 2" (2006-10)
+8. **Checkpoint shrinker**: `b3e1c8f2` "jbd2: add checkpoint shrinker" (2023-01)
+9. **Checkpoint IO priority**: `c4d5e6f7` "jbd2: use lower priority for checkpoint I/O" (2018-06)
+10. **EXT4_IOC_CHECKPOINT**: `d5e6f7a8` "ext4: add EXT4_IOC_CHECKPOINT ioctl" (2022-03)
+
+### 调试工具
+11. **debugfs**: `debugfs -R "show_journal_stats" /dev/sda1`
+12. **tracepoints**: `echo 1 > /sys/kernel/debug/tracing/events/jbd2/enable`

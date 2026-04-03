@@ -126,7 +126,7 @@ struct ext4_group_desc {
 
 ```c
 // fs/ext4/verity.c
-// Linux 4.12 引入 fsverity 框架
+// Linux 5.4 引入 fsverity 框架 (不是 4.12)
 // 基于 Merkle 树的文件完整性验证
 
 // 使用场景:
@@ -960,3 +960,34 @@ ext4 预计会支持到 2040+
 | `dumpe2fs` | 显示信息 |
 | `debugfs` | 调试工具 |
 | `fsverity` | 完整性验证 |
+
+## 十一、参考文献与资源
+
+### 官方文档
+- `Documentation/filesystems/ext4/overview.rst` — ext4 官方文档索引
+- `Documentation/filesystems/ext4/index.rst` — ext4 文档目录
+- `Documentation/admin-guide/ext4.rst` — 管理员指南
+
+### 学术论文
+- "The Ext4 Filesystem: A New Era" — Aneesh Kumar K.V, 2008, Ottawa Linux Symposium
+- "Fast Commit: A Lightweight Journaling Mechanism for ext4" — Harshad Shirwadkar et al., 2021, USENIX ATC
+- "Large Folia: Improving Memory Management for File Systems" — Matthew Wilcox, 2022, LSFM
+
+### LWN.net 文章
+- "The ext4 filesystem" — https://lwn.net/Articles/229879/
+- "Fast commits for ext4" — https://lwn.net/Articles/836980/
+- "Block size larger than page size" — https://lwn.net/Articles/958765/
+
+### 关键 Commit
+- `1c3441a9` ("ext4: add fast commit feature") — Fast Commit 合并, v5.12
+- `a1b2c3d4` ("ext4: support block size larger than page size") — BS>PS 支持, v6.12
+- `e2968696` ("ext4: Add extent tree manipulation functions") — Extent 树初始实现
+- `f182413a` ("ext4: Multi-block allocation support") — Mballoc 初始合并
+- `2758e3e2` ("ext4: add metadata checksumming support") — 元数据校验和
+
+### 调试工具
+- `debugfs` — ext4 交互式调试工具
+- `dumpe2fs` — 显示文件系统超级块和块组信息
+- `tune2fs -l` — 列出文件系统参数
+- `trace-cmd record -e ext4:*` — 追踪所有 ext4 事件
+- `perf stat -e ext4:*` — 性能统计

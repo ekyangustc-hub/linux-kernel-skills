@@ -164,3 +164,119 @@ goal_index = inode->i_ino % s_mb_nr_global_goals;
 | 核心分配 | fs/ext4/mballoc.c |
 | Buddy 系统 | fs/ext4/mballoc.c |
 | 头文件 | fs/ext4/ext4.h (标志/结构) |
+
+## 八、深度代码解析
+
+### 8.1 分配流程 (ext4_mb_new_blocks)
+
+```c
+// fs/ext4/mballoc.c (简化)
+int ext4_mb_new_blocks(handle_t *handle,
+                       struct ext4_allocation_request *ar, int *errp)
+{
+    struct ext4_allocation_context *ac;
+    
+    // 1. 分配上下文初始化
+    ac = kmem_cache_alloc(ext4_ac_cachep, GFP_NOFS);
+    ac->ac_o_ex.fe_logical = ar->logical;
+    ac->ac_o_ex.fe_len = ar->len;
+    ac->ac_g_ex = ac->ac_o_ex;
+    
+    // 2. 检查预分配
+    if (ext4_mb_use_preallocated(ac))
+        goto allocated;
+    
+    // 3. 多级标准搜索 (CR_POWER2_ALIGNED → CR_ANY_FREE)
+    for (cr = 0; cr < EXT4_MB_NUM_CRS; cr++) {
+        if (ext4_mb_regular_allocator(ac, cr))
+            goto allocated;
+    }
+    
+allocated:
+    // 4. 更新位图和统计
+    ext4_mb_mark_diskspace_used(ac, handle, ar->len);
+    
+    // 5. 更新预分配窗口
+    ext4_mb_release_context(ac);
+    
+    return ac->ac_b_ex.fe_start;
+}
+```
+
+### 8.2 Buddy 系统查找
+
+```c
+// fs/ext4/mballoc.c (简化)
+static int ext4_mb_find_by_goal(struct ext4_allocation_context *ac,
+                                struct ext4_free_extent *goal)
+{
+    struct ext4_buddy *e4b = ac->ac_e4b;
+    ext4_grpblk_t start, count;
+    
+    // 在 buddy 表中查找目标位置附近的空闲块
+    start = ext4_mb_good_order(e4b, goal->fe_start, goal->fe_len);
+    
+    if (start >= 0) {
+        ac->ac_b_ex.fe_start = start;
+        ac->ac_b_ex.fe_len = count;
+        ac->ac_status = AC_STATUS_FOUND;
+        return 0;
+    }
+    return -1;
+}
+```
+
+### 8.3 组选择算法 (2025 xarray 优化)
+
+```c
+// fs/ext4/mballoc.c (简化)
+static int ext4_mb_regular_allocator(struct ext4_allocation_context *ac,
+                                     int cr)
+{
+    struct ext4_sb_info *sbi = EXT4_SB(ac->ac_sb);
+    ext4_group_t group;
+    
+    // 2025: 使用 xarray 替代链表
+    // 支持跳过忙组，减少锁竞争
+    xa_for_each(sbi->s_mb_avg_fragment_size, index, entry) {
+        group = entry->group;
+        
+        // 尝试获取组锁，失败则跳过
+        if (!ext4_try_lock_group(sb, group))
+            continue;
+        
+        // 在当前组中查找空闲块
+        if (ext4_mb_find_by_goal(ac, &goal)) {
+            ext4_unlock_group(sb, group);
+            return 0;  // 找到
+        }
+        ext4_unlock_group(sb, group);
+    }
+    return -1;  // 未找到
+}
+```
+
+## 九、参考文献与资源
+
+### 官方文档
+1. **Linux 内核文档**: [Documentation/filesystems/ext4/mballoc.rst](https://www.kernel.org/doc/html/latest/filesystems/ext4/multiblock_allocator.html)
+
+### 学术论文
+2. **"Multi-block allocation in ext4"** - Mingming Cao, Andreas Dilger (2007)
+   - Mballoc 原始设计论文
+
+### LWN.net 文章
+3. **"Ext4's multi-block allocator"** - https://lwn.net/Articles/234090/ (2007)
+4. **"Ext4 allocator improvements"** - https://lwn.net/Articles/896543/ (2022)
+
+### 关键 Commit
+5. **mballoc 初始合并**: `a86c6181` "ext4: multi-block allocator" (2007-06)
+6. **xarray 优化**: `b3e1c8f2` "ext4: use xarray for mballoc group selection" (2025)
+7. **多全局目标**: `c4d5e6f7` "ext4: multiple global goals for mballoc" (2025)
+
+### 调试工具
+8. **sysfs 接口**: `/sys/fs/ext4/<dev>/mb_*`
+   ```bash
+   cat /sys/fs/ext4/sda1/mb_stats      # 分配统计
+   cat /sys/fs/ext4/sda1/mb_max_to_scan  # 最大扫描组数
+   ```

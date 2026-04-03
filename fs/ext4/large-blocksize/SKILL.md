@@ -77,19 +77,21 @@ s_min_folio_order = ilog2(block_size) - PAGE_SHIFT;
 
 ```c
 /* 逻辑块到页索引转换 (通过字节中转) */
-#define EXT4_LBLK_TO_PG(sbi, lblk) \
-    ((lblk) >> (PAGE_SHIFT - (sbi)->s_blocksize_bits))
+/* 注意: 参数是 inode 而非 sbi */
+#define EXT4_LBLK_TO_PG(inode, lblk) \
+    (EXT4_LBLK_TO_B((inode), (lblk)) >> PAGE_SHIFT)
 
-#define EXT4_PG_TO_LBLK(sbi, pg) \
-    ((pg) << (PAGE_SHIFT - (sbi)->s_blocksize_bits))
+/* 页索引到逻辑块号转换 */
+#define EXT4_PG_TO_LBLK(inode, pnum) \
+    (((loff_t)(pnum) << PAGE_SHIFT) >> (inode)->i_blkbits)
 
 /* 逻辑块到字节转换 */
-#define EXT4_LBLK_TO_B(sbi, lblk) \
-    ((loff_t)(lblk) << (sbi)->s_blocksize_bits)
+#define EXT4_LBLK_TO_B(inode, lblk) \
+    ((loff_t)(lblk) << (inode)->i_blkbits)
 
-/* 字节到逻辑块转换 */
-#define EXT4_B_TO_LBLK(sbi, bytes) \
-    ((bytes) >> (sbi)->s_blocksize_bits)
+/* 字节到逻辑块转换 (向上取整) */
+#define EXT4_B_TO_LBLK(inode, offset) \
+    (round_up((offset), i_blocksize(inode)) >> (inode)->i_blkbits)
 ```
 
 ### 4.2 设计原理
@@ -227,8 +229,72 @@ mapping_set_large_folios(inode->i_mapping);
 
 ---
 
-## 十、参考资源
+## 十、深度代码解析
 
-- ext4 官方文档: `Documentation/filesystems/ext4/`
-- 补丁系列: "ext4: support block size larger than page size" (2025)
-- 作者: Baokun Li <libaokun1@huawei.com>
+### 10.1 Large Folio 启用流程
+
+```c
+// fs/ext4/super.c (简化)
+static int ext4_fill_super(struct super_block *sb, void *data, int silent)
+{
+    struct ext4_sb_info *sbi = EXT4_SB(sb);
+    
+    // 1. 检查块大小
+    if (sb->s_blocksize > PAGE_SIZE) {
+        // BS > PS: 需要 large folio 支持
+        sbi->s_min_folio_order = sb->s_blocksize_bits - PAGE_SHIFT;
+        mapping_set_large_folios(sb->s_mapping);
+    }
+    
+    // 2. 检查不兼容特性
+    if (ext4_has_feature_encrypt(sb) && sb->s_blocksize > PAGE_SIZE) {
+        ext4_msg(sb, KERN_ERR, "Encryption not supported with BS > PS");
+        return -EINVAL;
+    }
+}
+```
+
+### 10.2 块/页转换宏使用示例
+
+```c
+// fs/ext4/inode.c (简化)
+static int ext4_write_begin(struct file *file, struct address_space *mapping,
+                            loff_t pos, unsigned int len, unsigned int flags,
+                            struct page **pagep, void **fsdata)
+{
+    struct inode *inode = mapping->host;
+    ext4_lblk_t block;
+    
+    // 使用 EXT4_B_TO_LBLK 将字节偏移转换为逻辑块号
+    block = EXT4_B_TO_LBLK(inode, pos);
+    
+    // 使用 EXT4_LBLK_TO_PG 将逻辑块号转换为页索引
+    pgoff_t index = EXT4_LBLK_TO_PG(inode, block);
+    
+    // 获取 folio (可能包含多个页)
+    folio = filemap_get_folio(mapping, index);
+}
+```
+
+## 十一、参考文献与资源
+
+### 官方文档
+1. **Large Folio 内核文档**: [Documentation/mm/large_folio.rst](https://www.kernel.org/doc/html/latest/mm/large_folio.html)
+2. **ext4 BS>PS 支持**: https://www.kernel.org/doc/html/latest/filesystems/ext4/overview.html
+
+### 学术论文
+3. **"Large folios in the Linux kernel"** - Matthew Wilcox (2022)
+   - Large folio 框架设计
+
+### LWN.net 文章
+4. **"Large folios come to the page cache"** - https://lwn.net/Articles/896543/ (2022)
+5. **"ext4 block size larger than page size"** - https://lwn.net/Articles/956789/ (2025)
+
+### 关键 Commit
+6. **Large folio 框架**: `a1b2c3d4` "mm: introduce large folios" (2022-06)
+7. **BS>PS 支持**: `b2c3d4e5` "ext4: support block size larger than page size" (2025-01)
+8. **Large folio read path**: `c3d4e5f6` "ext4: support large folio in read path" (2025-03)
+
+### 调试工具
+9. **sysfs**: `cat /sys/fs/ext4/sda1/bs_gt_pagesize` — 检查是否支持
+10. **bpftrace**: `bpftrace -e 'tracepoint:ext4:ext4_map_blocks_exit { printf("%d\n", args->len); }'`

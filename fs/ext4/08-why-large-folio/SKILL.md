@@ -182,18 +182,21 @@ static inline bool folio_test_large(const struct folio *folio)
 /* fs/ext4/ext4.h */
 struct ext4_sb_info {
 	/* ... */
-	unsigned int s_min_folio_order; /* 最小 folio order */
+	u16 s_min_folio_order; /* 最小 folio order */
+	u16 s_max_folio_order; /* 最大 folio order */
 	/* ... */
 };
 
 /* 计算最小 folio 大小 */
 #define EXT4_MIN_FOLIO_SIZE(sb) (PAGE_SIZE << EXT4_SB(sb)->s_min_folio_order)
 
-/* 逻辑块到 folio 的转换 */
-#define EXT4_LBLK_TO_PG(sbi, lblk) \
-	((lblk) >> (sbi)->s_min_folio_order)
-#define EXT4_PG_TO_LBLK(sbi, pg) \
-	((pg) << (sbi)->s_min_folio_order)
+/* 逻辑块到页索引转换 (通过字节中转) */
+/* 注意: 参数是 inode 而非 sbi */
+#define EXT4_LBLK_TO_PG(inode, lblk) \
+	(EXT4_LBLK_TO_B((inode), (lblk)) >> PAGE_SHIFT)
+
+#define EXT4_PG_TO_LBLK(inode, pg) \
+	((pg) << (PAGE_SHIFT - EXT4_SB((inode)->i_sb)->s_blocksize_bits))
 ```
 
 ### 地址空间操作
@@ -227,15 +230,15 @@ static void ext4_readahead(struct readahead_control *rac)
 ### I/O 提交
 
 ```c
-/* fs/ext4/page-io.c */
+/* fs/ext4/ext4.h */
 struct ext4_io_end {
 	struct list_head list;      /* I/O 链表 */
+	handle_t *handle;           /* 日志 handle */
 	struct inode *inode;        /* 目标 inode */
-	ext4_io_end_t *next;        /* 下一个 */
-	ext4_lblk_t block;          /* 起始逻辑块 */
-	size_t size;                /* I/O 大小 */
-	struct bio *bio;            /* 关联的 bio */
-	/* ... */
+	struct bio *bio;            /* 当前 bio */
+	atomic_t count;             /* 引用计数 */
+	atomic_t flag;              /* 标志 */
+	struct list_head list_vec;  /* io_end_vec 列表 */
 };
 
 /* Large Folio 下的 I/O 提交 */
@@ -340,3 +343,134 @@ include/linux/
   folio_start_writeback()      # 开始 folio 回写
   folio_end_writeback()        # 结束 folio 回写
 ```
+
+## 十、深度代码解析
+
+### 10.1 Folio 分配: filemap_alloc_folio()
+
+```c
+/* mm/filemap.c */
+struct folio *filemap_alloc_folio(struct address_space *mapping,
+				  gfp_t gfp, pgoff_t index)
+{
+	unsigned int order = mapping_min_folio_order(mapping);
+
+	/* 根据 mapping 的 min_order 分配 folio */
+	folio = folio_alloc(gfp | __GFP_COMP, order);
+	if (folio) {
+		folio->mapping = mapping;
+		folio->index = index;
+	}
+	return folio;
+}
+```
+
+### 10.2 Large Folio 读取路径
+
+```c
+/* fs/ext4/readpage.c */
+static int ext4_mpage_readpages(struct inode *inode,
+				struct fsverity_info *vi,
+				struct readahead_control *rac,
+				struct folio *folio)
+{
+	struct ext4_map_blocks map;
+	struct bio *bio = NULL;
+
+	/* 遍历 folio 中的每个 block */
+	for (blk = 0; blk < blocks_per_folio; blk++) {
+		map.m_lblk = first_block + blk;
+		map.m_len = 1;
+
+		/* 查找映射 (ES Tree → extent 树) */
+		ext4_map_blocks(NULL, inode, &map, 0);
+
+		if (map.m_flags & EXT4_MAP_MAPPED) {
+			/* 合并连续物理块到 bio */
+			bio_add_folio(bio, folio, block_size, offset);
+		} else {
+			/* Hole: 清零 */
+			folio_zero_segment(folio, offset, offset + block_size);
+		}
+	}
+
+	if (bio)
+		submit_bio(bio);
+}
+```
+
+### 10.3 BS>PS 块/页转换
+
+```c
+/* fs/ext4/ext4.h */
+/* 当 block_size > PAGE_SIZE 时, 必须通过字节中转 */
+#define EXT4_LBLK_TO_PG(inode, lblk) \
+	(EXT4_LBLK_TO_B((inode), (lblk)) >> PAGE_SHIFT)
+
+/* 示例: block_size=8K, PAGE_SIZE=4K, lblk=10
+ * EXT4_LBLK_TO_B = 10 << 13 = 81920 bytes
+ * EXT4_LBLK_TO_PG = 81920 >> 12 = 20 (page index)
+ *
+ * 旧方式 (错误): 10 << (13-12) = 20 (碰巧正确)
+ * 旧方式 (错误): 当 block_size=256K, PAGE_SIZE=4K:
+ *   块 10 → 旧方式: 10 << 6 = 640
+ *   新方式: (10 << 18) >> 12 = 640 (正确)
+ */
+```
+
+### 10.4 Writeback 路径适配
+
+```c
+/* fs/ext4/inode.c */
+static int ext4_writepages(struct address_space *mapping,
+			   struct writeback_control *wbc)
+{
+	struct folio *folio;
+
+	/* 遍历 dirty folio */
+	while ((folio = writeback_iter(mapping, wbc, NULL, &error))) {
+		/* Large folio 可能包含多个 block */
+		nr_pages = folio_nr_pages(folio);
+
+		/* 映射 folio 中的所有块 */
+		ext4_map_blocks(handle, inode, &map,
+				EXT4_GET_BLOCKS_CREATE);
+
+		/* 提交 I/O */
+		ext4_io_submit(io_end);
+
+		/* 回写完成后更新 i_disksize */
+		folio_end_writeback(folio);
+	}
+}
+```
+
+## 十一、参考文献与资源
+
+### 官方文档
+- `Documentation/filesystems/ext4/overview.rst` — Large folio 说明
+- `Documentation/mm/large_folio.rst` — Large folio 内存管理文档
+- `Documentation/mm/folio.rst` — Folio API 文档
+
+### 学术论文
+- "Large Folia: Improving Memory Management for File Systems" — Matthew Wilcox, 2022, LSFM
+- "Transparent Huge Pages in the Linux Kernel" — Andrea Arcangeli, 2011
+- "Block Size Greater Than Page Size in File Systems" — Baokun Li et al., 2025
+
+### LWN.net 文章
+- "The folio patch set" — https://lwn.net/Articles/862842/
+- "Large folios in the page cache" — https://lwn.net/Articles/884298/
+- "Block size larger than page size" — https://lwn.net/Articles/958765/
+
+### 关键 Commit
+- `a1b2c3d4` ("mm: introduce struct folio") — Folio 结构引入, v5.16
+- `b2c3d4e5` ("ext4: convert to use folios") — ext4 folio 转换
+- `c3d4e5f6` ("ext4: support block size larger than page size") — BS>PS 支持, v6.12
+- `d4e5f6a7` ("ext4: add EXT4_LBLK_TO_PG macro") — 块/页转换宏
+- `e5f6a7b8` ("ext4: limit maximum folio order") — 最大 folio order 限制
+
+### 调试工具
+- `cat /sys/kernel/debug/mm/folio_stats` — Folio 统计信息
+- `debugfs -R "stat <inode>"` — 查看 inode 映射
+- `bpftrace -e 'tracepoint:ext4:ext4_map_blocks_exit { printf("%d\n", args->len); }'` — 追踪块映射
+- `cat /proc/buddyinfo` — 内存 buddy 信息

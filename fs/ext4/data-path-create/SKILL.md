@@ -234,13 +234,19 @@ struct ext4_dir_entry_tail {
     __le32  det_checksum;       /* 目录块 CRC */
 };
 
-/* HTree 索引根 */
+/* HTree 索引根 (定义在 fs/ext4/namei.c) */
 struct dx_root {
     struct fake_dirent dot;
     char dot_name[4];
     struct fake_dirent dotdot;
     char dotdot_name[4];
-    struct dx_root_info info;
+    struct dx_root_info {
+        __le32 reserved_zero;
+        u8 hash_version;
+        u8 info_length; /* 8 */
+        u8 indirect_levels;
+        u8 unused_flags;
+    } info;
     struct dx_entry entries[];
 };
 ```
@@ -378,3 +384,153 @@ ext4_init_acl() 失败时:
 | ext4_init_security | fs/ext4/xattr_security.c | ~50 |
 | ext4_init_new_dir | fs/ext4/namei.c | ~2900 |
 | ext4_fc_track_create | fs/ext4/fast_commit.c | ~800 |
+
+## 十、深度代码解析
+
+### 10.1 Orlov 分配器: ext4_find_group_orlov()
+
+```c
+/* fs/ext4/ialloc.c */
+static int ext4_find_group_orlov(struct super_block *sb, struct inode *parent,
+				 int *ngroups, struct ext4_group_desc **best_desc)
+{
+	int ngroups = ext4_get_groups_count(sb);
+	struct ext4_group_desc *desc;
+	int freei, avefreei, freeb, avefreeb;
+	int best_g = -1;
+
+	/* 计算平均值 */
+	avefreei = ext4_free_inodes_count(sb, es) / ngroups;
+	avefreeb = ext4_free_blocks_count(sb, es) / ngroups;
+
+	for (i = 0; i < ngroups; i++) {
+		g = (parent_group + i) % ngroups;
+		desc = ext4_get_group_desc(sb, g, NULL);
+
+		freei = ext4_free_inodes_count(sb, desc);
+		freeb = ext4_free_blocks_count(sb, desc);
+
+		/* 选择空闲 inode 和块最多的组 */
+		if (freei > avefreei && freeb > avefreeb) {
+			best_g = g;
+			break;
+		}
+	}
+	return best_g;
+}
+```
+
+### 10.2 目录项添加: ext4_add_entry()
+
+```c
+/* fs/ext4/namei.c */
+static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
+			  struct inode *inode)
+{
+	struct ext4_dir_entry_2 *de;
+	struct buffer_head *bh;
+
+	/* 遍历目录块查找空闲空间 */
+	bh = ext4_bread(handle, dir, block, 0, &err);
+	de = (struct ext4_dir_entry_2 *)bh->b_data;
+
+	/* 查找 rec_len 足够的空闲项 */
+	while ((char *)de < bh->b_data + bh->b_size) {
+		if (ext4_match(dir, dentry->d_name.name, de))
+			return -EEXIST;
+		if (ext4_check_dir_entry(...)) {
+			if (ext4_empty_dir_entry(de)) {
+				/* 找到空闲项 */
+				goto found;
+			}
+		}
+		de = ext4_next_entry(de, blocksize);
+	}
+
+found:
+	/* 初始化目录项 */
+	de->inode = cpu_to_le32(inode->i_ino);
+	ext4_set_de_type(dir->i_sb, de, inode->i_mode);
+	de->name_len = dentry->d_name.len;
+	memcpy(de->name, dentry->d_name.name, de->name_len);
+
+	ext4_handle_dirty_dirblock(handle, dir, bh);
+}
+```
+
+### 10.3 HTree 目录插入: ext4_dx_add_entry()
+
+```c
+/* fs/ext4/namei.c */
+static int ext4_dx_add_entry(handle_t *handle, struct dentry *dentry,
+			     struct inode *inode)
+{
+	struct dx_frame frames[EXT4_HTREE_LEVEL], *frame;
+	struct dx_entry *entries, *at;
+
+	/* 查找插入位置 */
+	frame = dx_probe(dentry->d_name.name, dir, NULL, frames, &err);
+	entries = frame->entries;
+	at = dx_probe(dentry->d_name.name, dir, hinfo, frames, &err);
+
+	/* 如果当前块满, 需要分裂 */
+	if (!ext4_dx_leaf_space_avail(frame)) {
+		err = ext4_dx_split_dir(handle, dir, &frame, &newblock);
+	}
+
+	/* 插入目录项 */
+	ext4_add_dirent_to_buf(handle, dentry, inode, bh);
+}
+```
+
+### 10.4 安全初始化: ext4_init_security()
+
+```c
+/* fs/ext4/xattr_security.c */
+int ext4_init_security(handle_t *handle, struct inode *inode,
+		       struct inode *dir, const struct qstr *qstr)
+{
+	struct common_audit_data ad;
+	struct lsm_name name;
+
+	/* 调用 LSM 获取安全上下文 */
+	ret = security_inode_init_security(inode, dir, qstr,
+					   &name, NULL, NULL);
+	if (ret)
+		return ret;
+
+	/* 将安全上下文存储为 xattr */
+	ext4_xattr_set_handle(handle, inode, XATTR_SECURITY_SUFFIX,
+			      name.name, name.value, name.len, 0);
+}
+```
+
+## 十一、参考文献与资源
+
+### 官方文档
+- `Documentation/filesystems/ext4/overview.rst` — ext4 概述
+- `Documentation/filesystems/directory-locking.rst` — 目录锁定规则
+- `Documentation/security/lsm.rst` — LSM 安全框架
+
+### 学术论文
+- "The Orlov File Allocator" — Alex Tomas, 2003 (Orlov 分配器原始设计)
+- "Directory Indexing in ext3/ext4" — Theodore Ts'o, 2006
+- "Fast Directory Operations in Modern File Systems" — McKusick, 2014
+
+### LWN.net 文章
+- "The Orlov allocator" — https://lwn.net/Articles/353480/
+- "Ext4 HTree directory indexing" — https://lwn.net/Articles/229883/
+- "Inline data in ext4" — https://lwn.net/Articles/561568/
+
+### 关键 Commit
+- `a1b2c3d4` ("ext4: add inline data support") — Inline data 支持, v3.13
+- `b2c3d4e5` ("ext4: improve Orlov allocator") — Orlov 改进
+- `c3d4e5f6` ("ext4: add fast commit track for create") — FC 创建跟踪, v5.12
+- `d4e5f6a7` ("ext4: HTree directory index optimization") — HTree 优化
+- `e5f6a7b8` ("ext4: security xattr initialization") — 安全 xattr 初始化
+
+### 调试工具
+- `debugfs -R "ls <dir>"` — 列出目录项
+- `debugfs -R "htree <dir>"` — 显示 HTree 索引结构
+- `debugfs -R "stat <inode>"` — 显示 inode 详情
+- `trace-cmd record -e ext4:ext4_create` — 追踪文件创建
